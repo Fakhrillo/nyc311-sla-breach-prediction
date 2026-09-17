@@ -1,0 +1,16 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+joblib>=1.3
+
+# artifacts/model.joblib was pickled by scikit-learn 1.9.1. A pickle does not load
+# on an older scikit-learn than wrote it, and Colab's preinstalled version would
+# satisfy a looser floor and never be upgraded -- so this floor is deliberate.
+scikit-learn>=1.9
+
+# Notebook plots
+matplotlib>=3.7
+
+# Experiment tracking. Optional: train.py falls back to artifacts/runs.csv
+# when it is not installed, so the pipeline runs without it.
+mlflow>=2.9

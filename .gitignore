@@ -1,0 +1,8 @@
+# ~73 MB, downloaded from the NYC Open Data API on first run (src/sla.py: fetch)
+data/*.csv
+mlruns/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+.venv/
