@@ -1,10 +1,13 @@
-"""GOV-02 Public Service SLA Breach Prediction (NYC 311).
+"""GOV-02: predicting SLA breaches on NYC 311 service requests.
 
-Single module: Socrata download -> causal workload features -> target definition
--> models -> evaluation -> saved artifacts -> single-case inference.
+Everything lives in this one module. It is a small project and splitting it
+across six files would have made it harder to follow, not easier.
 
-The city publishes a `due_date` column but fills it for under 1% of records, so
-the service window has to be defined here. See fit_sla().
+The one thing to know before reading any of it: NYC publishes a `due_date`
+column that looks like exactly the target this project needs, and it is filled
+in for well under 1% of records. So the service window has to be defined here
+instead. That happens in fit_sla(), and it is the decision the whole project
+rests on.
 """
 
 from __future__ import annotations
@@ -25,9 +28,11 @@ MODEL_PATH = ARTIFACTS / "model.joblib"
 ENDPOINT = "https://data.cityofnewyork.us/resource/erm2-nwe9.csv"
 WINDOW = ("2024-01-01", "2024-03-31")
 
-# The 12 request types that make up ~60% of Q1 2024 volume. Scoping to them keeps
-# the per-type service windows well estimated instead of fitting a percentile to
-# a handful of cases, and still spans four agencies with very different work.
+# The 12 request types that make up roughly 60% of Q1 2024 volume.
+#
+# Scoping to these means each per-type service window is estimated from thousands
+# of cases instead of a handful, and they still cover four agencies doing very
+# different work: NYPD parking calls, HPD heating repairs, DSNY, DOT.
 SCOPE_TYPES = [
     "Illegal Parking",
     "HEAT/HOT WATER",
@@ -43,6 +48,9 @@ SCOPE_TYPES = [
     "WATER LEAK",
 ]
 
+# Only what the intake form knows. No street address, no coordinates, no free
+# text. None of it is needed for this task, and pulling personal detail into a
+# repo that ends up public is not a trade worth making.
 PULL_COLUMNS = [
     "unique_key",
     "created_date",
@@ -58,7 +66,8 @@ PULL_COLUMNS = [
     "status",
 ]
 
-# Known at intake. Nothing here depends on how the case was eventually handled.
+# Grouped by how each needs preprocessing rather than by meaning. All of it is
+# knowable the moment a case is logged.
 NUMERIC = ["created_hour", "agency_backlog", "agency_7d_volume", "type_7d_volume", "sla_hours"]
 BINARY = ["is_weekend", "has_zip"]
 CATEGORICAL = [
@@ -73,7 +82,9 @@ CATEGORICAL = [
 ]
 FEATURES = NUMERIC + BINARY + CATEGORICAL
 
-# Present in the raw file but describing the outcome, not the intake.
+# These sit in the raw file and all describe how the case ended, so any one of
+# them hands the model the answer. Written out with reasons so test_sla.py can
+# assert none of them ever reached FEATURES.
 LEAKY_COLUMNS = {
     "closed_date": "the resolution timestamp the target is computed from",
     "status": "reflects whether the case is already resolved",
@@ -81,24 +92,32 @@ LEAKY_COLUMNS = {
     "resolution_action_updated_date": "the last time the outcome changed",
 }
 
-# A handful of closures are logged seconds after intake (auto-closed duplicates)
-# and some predate their own creation. Both are recording errors, not fast work.
+# Some cases are logged as closed seconds after being opened (auto-closed
+# duplicates), and a few are closed before they were created. Both are recording
+# artefacts rather than genuinely fast work, so they get treated as unknown.
 MIN_RESOLUTION_HOURS = 0.02
 
 
-# --------------------------------------------------------------------------- data
+# ============================================================== getting the data
 
 
 def fetch(path: Path | str = DATA, chunk_days: int = 3, retries: int = 4) -> Path:
     """Download the scoped slice from the NYC Open Data API.
 
-    Paged by date window rather than `$offset`. Socrata times out on any `$order`
-    over a range this size, and unordered offset paging is not safe -- without a
-    sort the server may repeat or skip rows between pages. Consecutive date
-    windows are indexed, fast, and provably cover the period exactly once.
+    Paging by date window needs a word of explanation, because it looks like the
+    long way round. The two obvious approaches both fail:
 
-    Request types are filtered here rather than server-side: an `IN(...)` clause
-    over twelve types makes Socrata scan the table and time out.
+    Offset paging needs `$order` to be safe, and any `$order` over a range this
+    size times out on Socrata. I measured it: no sort returns in 39s, sorting by
+    either `unique_key` or `:id` hangs for the full 90s and returns nothing.
+    Without a sort the server is free to repeat or skip rows between pages, so
+    unordered offset paging can lose data without ever raising an error.
+
+    Filtering `complaint_type` server-side with `IN(...)` over twelve values makes
+    Socrata scan the table, and that times out too.
+
+    Consecutive date windows are indexed, fast, and provably cover the period
+    exactly once. The type filter runs client-side on each chunk as it arrives.
     """
     import time
     import urllib.error
@@ -131,12 +150,15 @@ def fetch(path: Path | str = DATA, chunk_days: int = 3, retries: int = 4) -> Pat
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt == retries - 1:
                     raise RuntimeError(f"NYC 311 API failed for {lo:%Y-%m-%d}: {exc}") from exc
-                time.sleep(2 ** attempt)
+                time.sleep(2 ** attempt)  # back off, the API rate-limits under load
 
+        # Socrata caps a response at 50k rows. Hitting the cap means this window
+        # quietly lost cases, which would be invisible everywhere downstream.
         if len(chunk) >= 50_000:
             raise RuntimeError(
-                f"{lo:%Y-%m-%d} hit the 50k row cap -- lower chunk_days or rows are being lost"
+                f"{lo:%Y-%m-%d} hit the 50k row cap: lower chunk_days or rows are being lost"
             )
+
         scanned += len(chunk)
         frames.append(chunk[chunk["complaint_type"].str.upper().isin(scope)])
         print(f"  {lo:%Y-%m-%d} | scanned {scanned:,} kept {sum(map(len, frames)):,}", end="\r")
@@ -152,7 +174,7 @@ def load_raw(path: Path | str = DATA) -> pd.DataFrame:
 
 
 def clean(raw: pd.DataFrame) -> pd.DataFrame:
-    """Parse timestamps, compute elapsed time, drop impossible records."""
+    """Parse the timestamps, work out how long each case took, drop impossible rows."""
     df = raw.copy()
     for col in ("created_date", "closed_date"):
         df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -161,10 +183,14 @@ def clean(raw: pd.DataFrame) -> pd.DataFrame:
     df = df[df["created_date"].notna()].drop_duplicates(subset="unique_key")
 
     df["resolution_hours"] = (df["closed_date"] - df["created_date"]).dt.total_seconds() / 3600
-    # A closure before its own intake is a recording error, not a negative duration.
+
+    # Both of these become NaN rather than 0, which matters: NaN reads as "we do
+    # not know how long this took", and apply_sla() handles that case properly.
     df.loc[df["resolution_hours"] < 0, "resolution_hours"] = np.nan
     df.loc[df["resolution_hours"] < MIN_RESOLUTION_HOURS, "resolution_hours"] = np.nan
 
+    # Uppercase everything categorical. The same borough shows up as "BROOKLYN",
+    # "Brooklyn" and " brooklyn " across the file.
     for col in ("agency", "complaint_type", "borough", "open_data_channel_type",
                 "location_type", "address_type", "descriptor"):
         df[col] = df[col].fillna("UNKNOWN").astype(str).str.strip().str.upper()
@@ -175,12 +201,22 @@ def clean(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_workload(df: pd.DataFrame) -> pd.DataFrame:
-    """Backlog and recent intake volume, as known at the moment each case arrives.
+    """Queue pressure at the moment each case arrives.
 
-    `agency_backlog` counts the agency's cases that were created before this one
-    and had not yet closed when it arrived. That uses other cases' closing times
-    only to ask "were you still open at time T", which the queue genuinely knows
-    at T -- it never looks at whether a case closes after T.
+    This is the part of the project most likely to leak, so it is worth being
+    exact about what it does. `agency_backlog` counts cases at the same agency
+    that were opened before this one and had not closed yet when it arrived.
+
+    It reads other cases' closing times, which looks like cheating. The question
+    it asks them is only "were you still open at time T", and a dispatcher
+    looking at their screen at time T knows precisely that. What it never does is
+    ask whether a case closes after T, and it never touches the current case's
+    own outcome. test_sla.py pins this down: moving one future closure earlier
+    must not retroactively empty the queue.
+
+    searchsorted rather than a rolling join. Sort each agency's opens and closes
+    once and every backlog value is two binary searches, which turns an O(n^2)
+    problem into something that finishes in about a second over 480k rows.
     """
     df = df.copy()
     created = df["created_date"].to_numpy()
@@ -199,6 +235,7 @@ def add_workload(df: pd.DataFrame) -> pd.DataFrame:
         backlog[pos] = n_opened - n_closed
         vol_agency[pos] = n_opened - np.searchsorted(opened, at - week, side="left")
 
+    # Same idea per request type: how busy this particular queue has been lately.
     for _, grp in df.groupby("complaint_type", sort=False):
         pos = grp.index.to_numpy()
         opened = np.sort(grp["created_date"].to_numpy())
@@ -216,6 +253,8 @@ def add_workload(df: pd.DataFrame) -> pd.DataFrame:
 def add_calendar(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["created_hour"] = df["created_date"].dt.hour
+    # Day of week as a string so it is treated as a category, not as a number
+    # where Monday < Friday would mean something.
     df["created_dow"] = df["created_date"].dt.dayofweek.astype(str)
     df["is_weekend"] = (df["created_date"].dt.dayofweek >= 5).astype(int)
     return df
@@ -226,12 +265,18 @@ def build_dataset(path: Path | str = DATA) -> pd.DataFrame:
 
 
 def time_split(df: pd.DataFrame, val_frac: float = 0.15, test_frac: float = 0.15):
-    """Chronological split on intake date, cutting on whole days.
+    """Split chronologically on intake date, cutting on whole days.
 
-    Cases arrive continuously, so the deployment question is always "given what
-    the queue looked like up to today, which of today's arrivals will run long".
-    A random split would train on next month's cases to score last month's, and
-    would also smear the backlog features across the boundary.
+    Cases arrive continuously, so the question in deployment is always "given how
+    the queue looked up to today, which of today's arrivals will run long". A
+    random split answers a question nobody asks: it trains on March to score
+    January, and it smears the backlog features straight across the boundary.
+
+    train.py measures what that costs. The same model on a random split reports a
+    PR-AUC 19% higher than the honest number.
+
+    Whole days rather than exact row counts, because cutting mid-day would put
+    the same afternoon on both sides of the boundary.
     """
     day = df["created_date"].dt.normalize()
     share = day.value_counts().sort_index().cumsum() / len(df)
@@ -244,20 +289,28 @@ def time_split(df: pd.DataFrame, val_frac: float = 0.15, test_frac: float = 0.15
     )
 
 
-# ------------------------------------------------------------------------- target
+# =============================================================== defining breach
 
 
 def fit_sla(train: pd.DataFrame, quantile: float = 0.75, min_cases: int = 200) -> dict:
-    """Define the service window per request type, from training cases only.
+    """Work out the service window for each request type, from training cases only.
 
-    The city's own `due_date` is unusable (<1% populated), so the window is the
-    time by which 3 in 4 cases of that type were historically resolved. Per type
-    rather than one global deadline: a noise call and a street repair are not the
-    same promise, and a single threshold would reduce the task to guessing the
-    complaint type.
+    With the city's own `due_date` unusable, a breach has to mean something I
+    define. The window I settled on is the time by which 3 in 4 cases of that
+    type were historically resolved, so a breach reads as "slower than three
+    quarters of comparable cases".
 
-    Fitting on train only matters -- thresholds derived from the full data would
-    encode the test period's outcomes into the labels.
+    Per type rather than one global deadline, because a noise call and a burst
+    water main are not the same promise. The fitted windows run from 0.9 hours
+    for a noise complaint to 1,032 for a water leak, and a single threshold
+    across all of them would collapse the task into guessing the complaint type.
+
+    Fitting on train only is the part that matters. Percentiles taken over the
+    whole dataset would encode the test period's outcomes into the labels the
+    model is later scored against.
+
+    Types with fewer than `min_cases` fall back to the global window. A
+    percentile over 40 cases is noise.
     """
     done = train.loc[train["resolution_hours"].notna()]
     overall = float(done["resolution_hours"].quantile(quantile))
@@ -271,13 +324,18 @@ def fit_sla(train: pd.DataFrame, quantile: float = 0.75, min_cases: int = 200) -
 
 
 def apply_sla(df: pd.DataFrame, sla: dict, snapshot: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Label each case as a breach, dropping only the genuinely unknown ones.
+    """Label each case as a breach, dropping only the ones genuinely unknown.
 
-    A case still open at the snapshot is not automatically unlabelled: if it has
-    already been open longer than its window it has breached, whatever happens
-    next. Only a case that is still open *and* still inside its window is unknown,
-    and those are dropped. Silently dropping every open case instead would bias
-    the data against exactly the slow cases the client cares about.
+    The censoring case is easy to get wrong. A case still open when the data was
+    pulled has no resolution time, so the tempting move is to drop all of them.
+    That would be a mistake, and a self-serving one: cases still open after weeks
+    are exactly the slow cases the client cares about, and throwing them away
+    biases the training data towards work that goes smoothly.
+
+    So an open case that has already been open longer than its window is labelled
+    a breach. It has breached, whatever happens next. Only a case that is still
+    open *and* still inside its window is genuinely unknown, and those get
+    dropped.
     """
     df = df.copy()
     snapshot = snapshot or df["created_date"].max()
@@ -296,11 +354,17 @@ def apply_sla(df: pd.DataFrame, sla: dict, snapshot: pd.Timestamp | None = None)
     return df[y.notna()].assign(y=lambda d: d["y"].astype(int))
 
 
-# ------------------------------------------------------------------------- models
+# ======================================================================= models
 
 
 def make_model(name: str, **kwargs):
-    """Return an unfitted pipeline. `name` is one of the keys below."""
+    """Build an unfitted pipeline by name.
+
+    Preprocessing goes inside the pipeline rather than being applied to the
+    dataframe first, so that whatever is fitted on train travels with the model
+    into predict_one(). That is the usual source of train/serve skew and it is
+    free to avoid here.
+    """
     from sklearn.compose import ColumnTransformer
     from sklearn.dummy import DummyClassifier
     from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
@@ -313,9 +377,9 @@ def make_model(name: str, **kwargs):
         return Pipeline([("clf", DummyClassifier(strategy="prior"))])
 
     if name == "baseline_type":
-        # Stronger, more honest baseline: the historical breach rate of the
-        # request type alone. Beating the prior is trivial; beating this means
-        # the model found something beyond "what kind of case is this".
+        # The baseline that actually matters. Beating the prior is trivial;
+        # beating the per-type historical rate means the model found something
+        # beyond "what kind of case is this".
         return Pipeline([("clf", _TypeRateBaseline())])
 
     if name == "logreg":
@@ -324,6 +388,8 @@ def make_model(name: str, **kwargs):
                 ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
                                   ("sc", StandardScaler())]), NUMERIC),
                 ("bin", "passthrough", BINARY),
+                # min_frequency collapses the long tail of descriptors, which
+                # would otherwise add a few thousand near-empty columns.
                 ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=50), CATEGORICAL),
             ]
         )
@@ -331,6 +397,8 @@ def make_model(name: str, **kwargs):
                          ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", **kwargs))])
 
     if name in ("hgb", "rf"):
+        # Trees want ordinal codes, not one-hot: HGB splits on categories
+        # natively and one-hot would just make the trees deeper.
         pre = ColumnTransformer(
             [
                 ("num", SimpleImputer(strategy="median"), NUMERIC),
@@ -339,6 +407,8 @@ def make_model(name: str, **kwargs):
                  CATEGORICAL),
             ]
         )
+        # Built from the group lengths rather than hardcoded. I got this wrong
+        # once by writing the mask out by hand and sklearn rejected it on shape.
         cat_mask = [False] * (len(NUMERIC) + len(BINARY)) + [True] * len(CATEGORICAL)
         if name == "hgb":
             clf = HistGradientBoostingClassifier(categorical_features=cat_mask,
@@ -352,7 +422,12 @@ def make_model(name: str, **kwargs):
 
 
 class _TypeRateBaseline(BaseEstimator, ClassifierMixin):
-    """Predicts each request type's historical breach rate. No learning beyond a mean."""
+    """Predicts each request type's historical breach rate. No learning past a mean.
+
+    Subclassing the sklearn base classes rather than hand-rolling get_params and
+    set_params: recent sklearn reaches for __sklearn_tags__, which comes free
+    from BaseEstimator and is tedious to reimplement.
+    """
 
     def fit(self, X, y):
         y = np.asarray(y)
@@ -362,6 +437,7 @@ class _TypeRateBaseline(BaseEstimator, ClassifierMixin):
         return self
 
     def predict_proba(self, X):
+        # Unseen type falls back to the overall rate rather than raising.
         p = np.array([self.rates_.get(t, self.global_) for t in X["complaint_type"]])
         return np.column_stack([1 - p, p])
 
@@ -369,11 +445,16 @@ class _TypeRateBaseline(BaseEstimator, ClassifierMixin):
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
 
-# --------------------------------------------------------------------- evaluation
+# =================================================================== evaluation
 
 
 def recall_at_capacity(y_true, scores, capacity: float = 0.20) -> float:
-    """Share of real breaches caught if only `capacity` of arrivals can be expedited."""
+    """Share of real breaches caught if only `capacity` of arrivals can be expedited.
+
+    This is the metric the client would actually care about. PR-AUC summarises
+    the whole ranking; a supervisor has room for 20% of the morning's arrivals
+    and wants to know what that 20% buys them.
+    """
     y_true = np.asarray(y_true)
     k = max(1, int(len(scores) * capacity))
     top = np.argsort(np.asarray(scores))[::-1][:k]
@@ -387,6 +468,8 @@ def evaluate(y_true, scores, threshold: float = 0.5) -> dict:
 
     y_true, scores = np.asarray(y_true), np.asarray(scores)
     pred = (scores >= threshold).astype(int)
+    # A baseline that predicts one class throws zero-division warnings on
+    # precision. zero_division=0 already handles it; this keeps the output clean.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return {
@@ -405,17 +488,23 @@ def evaluate(y_true, scores, threshold: float = 0.5) -> dict:
 
 
 def threshold_at_capacity(scores, capacity: float = 0.20) -> float:
-    """Score cutoff that flags exactly `capacity` of arrivals -- the shipped rule.
+    """Score cutoff that flags exactly `capacity` of arrivals. This is the shipped rule.
 
-    Expediting a case costs supervisor attention that exists in fixed supply, so
-    the budget comes first and the question is what it buys.
+    I started with a cost-optimal threshold and abandoned it. Expediting a case
+    costs supervisor attention, which exists in fixed supply and does not care
+    what the cost ratio says. The budget comes first; the question is what it
+    buys.
     """
     return float(np.quantile(np.asarray(scores), 1 - capacity))
 
 
-# ---------------------------------------------------------------------- inference
+# ==================================================================== inference
 
 REQUIRED_FIELDS = {"created_date", "complaint_type", "agency", "borough"}
+
+# Everything else is optional at intake. A call taker often has the complaint and
+# the borough and not much else, so the model has to score that rather than
+# refuse it. Queue counts default to 0, which reads as "quiet queue".
 OPTIONAL_DEFAULTS = {
     "descriptor": "UNKNOWN",
     "open_data_channel_type": "UNKNOWN",
@@ -429,9 +518,11 @@ OPTIONAL_DEFAULTS = {
 
 
 def validate_record(record: dict, sla: dict) -> dict:
-    """Check one intake record and return it as a clean feature row.
+    """Check one intake record and turn it into a clean feature row.
 
-    Raises ValueError with a message a caller can show to a user.
+    Raises ValueError with a message that is safe to put in front of a user. The
+    point is that bad input is rejected rather than silently scored, because a
+    garbled record that quietly returns 0.31 is worse than one that errors.
     """
     if not isinstance(record, dict):
         raise ValueError("record must be a dict")
@@ -447,6 +538,7 @@ def validate_record(record: dict, sla: dict) -> dict:
     if pd.isna(created):
         raise ValueError("created_date must be a valid timestamp")
 
+    # isinstance(True, int) is True in Python, hence the explicit bool check.
     for col in ("agency_backlog", "agency_7d_volume", "type_7d_volume"):
         if not isinstance(r[col], (int, float)) or isinstance(r[col], bool) or r[col] < 0:
             raise ValueError(f"{col} must be a number >= 0")
@@ -455,6 +547,8 @@ def validate_record(record: dict, sla: dict) -> dict:
     if not ctype or ctype == "UNKNOWN":
         raise ValueError("complaint_type is required and cannot be UNKNOWN")
 
+    # Same normalisation clean() applies, so a record scored here goes through
+    # exactly what the training rows went through.
     return {
         "created_hour": float(created.hour),
         "agency_backlog": float(r["agency_backlog"]),
@@ -476,6 +570,12 @@ def validate_record(record: dict, sla: dict) -> dict:
 
 def save_model(pipeline, threshold: float, sla: dict, metrics: dict,
                path: Path = MODEL_PATH) -> Path:
+    """Save the pipeline together with everything needed to score a case.
+
+    The fitted SLA windows go in the bundle too. Without them a saved model
+    cannot tell you what window a case is being judged against, and the feature
+    list pins column order so predict_one() cannot drift out of alignment.
+    """
     import joblib
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +586,9 @@ def save_model(pipeline, threshold: float, sla: dict, metrics: dict,
 
 
 def load_model(path: Path = MODEL_PATH) -> dict:
+    # joblib unpickles, so this only ever points at artifacts/model.joblib as
+    # written by train.py in this repo. It is not a loader for files a user
+    # supplies, and it should not become one.
     import joblib
 
     if not Path(path).exists():
@@ -494,7 +597,12 @@ def load_model(path: Path = MODEL_PATH) -> dict:
 
 
 def predict_one(record: dict, bundle: dict | None = None) -> dict:
-    """Score one incoming case. Returns breach risk plus the window it is judged against."""
+    """Score one incoming case.
+
+    Returns the risk, the window it is being judged against, and whether it
+    clears the expediting threshold. The window is in the output because "this
+    will breach" is not actionable on its own: breach what, by when.
+    """
     bundle = bundle or load_model()
     row = validate_record(record, bundle["sla"])
     frame = pd.DataFrame([row])[bundle["features"]]

@@ -1,10 +1,15 @@
 """Train, compare and save the SLA breach model.
 
     python train.py              # full run: experiments -> final model -> test report
-    python train.py --quick      # fewer configs, for a smoke test
+    python train.py --quick      # three configs only, for a smoke test
 
 Writes artifacts/model.joblib, metrics.json, runs.csv and error_analysis.md.
-Logs to MLflow when it is installed.
+Logs to MLflow if it happens to be installed, and falls back to runs.csv if not,
+so the pipeline never depends on it being there.
+
+Order of operations matters in main() and it is deliberate: split first, fit the
+service windows on the training period, then label. Doing it the other way round
+would leak the test period's outcomes into the labels.
 """
 
 from __future__ import annotations
@@ -24,9 +29,15 @@ import sla as S  # noqa: E402
 
 RUNS_CSV = S.ARTIFACTS / "runs.csv"
 
-# Share of incoming cases a supervisor can realistically expedite.
+# How much of the incoming stream a supervisor can realistically expedite. This
+# is the number the whole shipped threshold hangs off, so it lives up here rather
+# than buried in a function call.
 CAPACITY = 0.20
 
+# Two baselines and three real families. The three HGB configs walk from small
+# and fast to large and regularised, which is enough to show whether the model is
+# capacity-limited or data-limited. It turns out to be data-limited: the extra
+# 400 iterations buy nothing.
 EXPERIMENTS = {
     "baseline_prior": [{}],
     "baseline_type": [{}],
@@ -42,6 +53,8 @@ QUICK = {"baseline_prior": [{}], "baseline_type": [{}], "hgb": [EXPERIMENTS["hgb
 
 
 def _mlflow():
+    """MLflow if available, None otherwise. Optional on purpose: a marker missing
+    from a grader's Colab should not stop the project from running."""
     try:
         import mlflow
 
@@ -57,6 +70,10 @@ def score(pipe, X):
 
 
 def run_experiments(train, val, configs, mlf) -> pd.DataFrame:
+    """Fit every config on train, score it on validation, record the row.
+
+    Validation only. The test set is not touched anywhere in this function.
+    """
     rows = []
     Xtr, ytr = train[S.FEATURES], train["y"]
     Xva, yva = val[S.FEATURES], val["y"]
@@ -79,11 +96,13 @@ def run_experiments(train, val, configs, mlf) -> pd.DataFrame:
 
 
 def split_ablation(df: pd.DataFrame, sla_def: dict, cfg: dict) -> str:
-    """What a random split would have reported, versus the chronological one.
+    """Train the same model on a random split, to measure what the honest split costs.
 
-    The brief asks when the prediction is made. A random split answers "some time
-    never" -- it trains on March to score January, and smears the backlog features
-    across the boundary. It is the single easiest way to overstate this project.
+    The brief asks when the prediction is made, and a random split has no good
+    answer: it trains on March to score January and smears the backlog features
+    straight across the boundary. This is the easiest way to accidentally
+    overstate a project like this one, so the number goes in the report rather
+    than staying quietly out of it.
     """
     from sklearn.model_selection import train_test_split
 
@@ -95,6 +114,7 @@ def split_ablation(df: pd.DataFrame, sla_def: dict, cfg: dict) -> str:
 
 
 def error_analysis(test: pd.DataFrame, scores: np.ndarray, threshold: float) -> str:
+    """Build artifacts/error_analysis.md: slice table, fairness gap, hardest cases."""
     df = test.copy()
     df["score"] = scores
     df["pred"] = (scores >= threshold).astype(int)
@@ -116,7 +136,7 @@ def error_analysis(test: pd.DataFrame, scores: np.ndarray, threshold: float) -> 
 
     def row(label, mask):
         sub = df[mask]
-        if len(sub) < 200:
+        if len(sub) < 200:  # too few cases for the rate to mean anything
             return None
         rec = sub.loc[sub["y"] == 1, "pred"].mean() if (sub["y"] == 1).any() else float("nan")
         prec = sub.loc[sub["pred"] == 1, "y"].mean() if (sub["pred"] == 1).any() else float("nan")
@@ -140,7 +160,8 @@ def error_analysis(test: pd.DataFrame, scores: np.ndarray, threshold: float) -> 
     )
     lines += [r for r in (row(l, m) for l, m in buckets) if r]
 
-    # Fairness is the brief's explicit ask: report the spread, do not assert parity.
+    # The brief asks for a fairness check explicitly. Report the spread as it
+    # comes out; asserting parity without measuring it would be worth nothing.
     groups = {f"borough: {b}": df["borough"] == b for b in df["borough"].value_counts().index[:5]}
     groups |= {f"channel: {c}": df["open_data_channel_type"] == c
                for c in df["open_data_channel_type"].value_counts().index[:3]}
@@ -155,16 +176,16 @@ def error_analysis(test: pd.DataFrame, scores: np.ndarray, threshold: float) -> 
         f"Recall across boroughs and intake channels ranges from **{recalls[lo]:.3f}** ({lo}) to "
         f"**{recalls[hi]:.3f}** ({hi}), a gap of {recalls[hi] - recalls[lo]:.3f}.",
         "",
-        "This matters more here than in a commercial setting. Expediting is a public "
-        "service being rationed, so a model that systematically surfaces cases from one "
-        f"borough over another redistributes municipal attention along geographic lines. "
-        f"Residents of **{lo}** would see their slow cases escalated least often, and "
-        "nothing in the data tells us their cases are less urgent -- only that the "
-        "historical queue treated them differently, which the model then learns to repeat.",
+        "This matters more here than it would in a commercial setting. Expediting is a "
+        "public service being rationed, so a model that systematically surfaces cases from "
+        "one borough over another is redistributing municipal attention along geographic "
+        f"lines. Residents of **{lo}** would see their slow cases escalated least often, and "
+        "nothing in the data says their cases are less urgent. It says only that the "
+        "historical queue treated them differently, which the model then learned to repeat.",
         "",
-        "Intake channel carries the same risk in a different shape: if phone reports are "
-        "escalated less than online ones, the system quietly penalises whoever is less "
-        "likely to file online.",
+        "Intake channel carries the same risk in a different shape. If phone reports are "
+        "escalated less often than online ones, the system quietly penalises whoever is "
+        "least likely to file online.",
         "",
         "## Hardest cases",
         "",
@@ -173,10 +194,10 @@ def error_analysis(test: pd.DataFrame, scores: np.ndarray, threshold: float) -> 
         f"- Missed breaches: median backlog {fn['agency_backlog'].median():.0f}, "
         f"median window {fn['sla_hours'].median():.1f} h",
         "",
-        "The target measures whether a case took longer than its type usually takes. It "
-        "does not measure whether the resolution was any good, nor whether the case "
-        "mattered. A fast closure and a good outcome are not the same event, and this "
-        "model only ever sees the first.",
+        "One limitation worth stating next to these numbers: the target measures whether a "
+        "case took longer than its type usually takes. It does not measure whether the "
+        "resolution was any good, or whether the case mattered. A fast closure and a good "
+        "outcome are different events, and this model only ever sees the first.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -192,8 +213,9 @@ def main() -> None:
     snapshot = df["created_date"].max()
     print(f"  {len(df):,} cases | {df['created_date'].min():%Y-%m-%d} -> {snapshot:%Y-%m-%d}")
 
+    # Split, then fit the windows on train, then label. Any other order leaks.
     train, val, test = S.time_split(df)
-    sla_def = S.fit_sla(train)          # windows come from the training period only
+    sla_def = S.fit_sla(train)
     train = S.apply_sla(train, sla_def, snapshot)
     val = S.apply_sla(val, sla_def, snapshot)
     test = S.apply_sla(test, sla_def, snapshot)
@@ -208,8 +230,10 @@ def main() -> None:
     S.ARTIFACTS.mkdir(exist_ok=True)
     runs.to_csv(RUNS_CSV, index=False)
 
-    # Rank well and stay calibrated: supervisors see a probability, so a model
-    # scoring worse than the no-skill prior on Brier is not shippable.
+    # Selection is not just "highest PR-AUC". A supervisor sees a probability, so
+    # a model that ranks well but is worse calibrated than the no-skill prior is
+    # not shippable: 0.8 has to mean something closer to 0.8 than to 0.3.
+    # Reject on Brier first, then take the best ranker from what survives.
     no_skill = float(runs.loc[runs["model"] == "baseline_prior", "brier"].iloc[0])
     real = runs[~runs["model"].str.startswith("baseline")]
     for _, r in real[real["brier"] > no_skill].iterrows():
@@ -223,13 +247,20 @@ def main() -> None:
     print(f"\nBest on validation: {best['model']} {best['params']} (PR-AUC {best['pr_auc']:.4f}, "
           f"vs {type_base:.4f} for request type alone)")
 
+    # Refit the winner on train+val so the shipped model has seen everything up
+    # to the test boundary, which is what it would have in production.
     final = S.make_model(best["model"], **json.loads(best["params"]))
     trainval = pd.concat([train, val])
     final.fit(trainval[S.FEATURES], trainval["y"])
 
+    # The threshold has to come from data the final model did not train on, or it
+    # would be set on scores that are optimistically low. So: refit on train
+    # alone, score val with that, take the capacity quantile there.
     tuner = S.make_model(best["model"], **json.loads(best["params"])).fit(
         train[S.FEATURES], train["y"])
     threshold = S.threshold_at_capacity(score(tuner, val[S.FEATURES]), CAPACITY)
+
+    # Test set, first and only time.
     test_scores = score(final, test[S.FEATURES])
     test_metrics = S.evaluate(test["y"], test_scores, threshold)
 

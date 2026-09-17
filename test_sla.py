@@ -34,8 +34,9 @@ def test_backlog_counts_only_what_was_open_at_arrival():
     assert out.loc[0, "agency_backlog"] == 0, out.loc[0, "agency_backlog"]
     # At 01-03 only case 1 is open.
     assert out.loc[1, "agency_backlog"] == 1, out.loc[1, "agency_backlog"]
-    # At 01-07 case 1 has closed but case 2 is still open -- and case 2 closes on
-    # 01-10, in the future, which must not retroactively empty the queue.
+    # At 01-07 case 1 has closed but case 2 is still open. Case 2 closes on 01-10,
+    # which is in the future here, and must not retroactively empty the queue.
+    # This assertion is the whole reason this file exists.
     assert out.loc[2, "agency_backlog"] == 1, out.loc[2, "agency_backlog"]
     # A case never counts itself.
     assert (out["agency_backlog"] <= np.arange(len(out))).all()

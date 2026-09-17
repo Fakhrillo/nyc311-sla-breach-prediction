@@ -32,13 +32,13 @@
 
 Recall across boroughs and intake channels ranges from **0.138** (borough: BROOKLYN) to **0.576** (borough: QUEENS), a gap of 0.438.
 
-This matters more here than in a commercial setting. Expediting is a public service being rationed, so a model that systematically surfaces cases from one borough over another redistributes municipal attention along geographic lines. Residents of **borough: BROOKLYN** would see their slow cases escalated least often, and nothing in the data tells us their cases are less urgent -- only that the historical queue treated them differently, which the model then learns to repeat.
+This matters more here than it would in a commercial setting. Expediting is a public service being rationed, so a model that systematically surfaces cases from one borough over another is redistributing municipal attention along geographic lines. Residents of **borough: BROOKLYN** would see their slow cases escalated least often, and nothing in the data says their cases are less urgent. It says only that the historical queue treated them differently, which the model then learned to repeat.
 
-Intake channel carries the same risk in a different shape: if phone reports are escalated less than online ones, the system quietly penalises whoever is less likely to file online.
+Intake channel carries the same risk in a different shape. If phone reports are escalated less often than online ones, the system quietly penalises whoever is least likely to file online.
 
 ## Hardest cases
 
 - False alarms: median backlog 352, median window 2.8 h
 - Missed breaches: median backlog 340, median window 3.4 h
 
-The target measures whether a case took longer than its type usually takes. It does not measure whether the resolution was any good, nor whether the case mattered. A fast closure and a good outcome are not the same event, and this model only ever sees the first.
+One limitation worth stating next to these numbers: the target measures whether a case took longer than its type usually takes. It does not measure whether the resolution was any good, or whether the case mattered. A fast closure and a good outcome are different events, and this model only ever sees the first.
