@@ -1,6 +1,6 @@
 # Public Service SLA Breach Prediction (NYC 311)
 
-**Student:** Fakhrillo
+**Student:** Fakhrillokhon Lutfillokhonov
 **Track:** Field-Based Scenario, GOV-02 (GovTech)
 **Client:** Government service centre / municipal 311 operation
 
