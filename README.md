@@ -341,9 +341,15 @@ python train.py         # ~1 min once the data is cached; --quick for a smoke te
 
 The first run downloads about 73 MB from the NYC Open Data API, which takes two to three
 minutes. `train.py` writes `artifacts/model.joblib`, `metrics.json`, `runs.csv` and
-`error_analysis.md`. Experiments log to MLflow when it is installed
-(`mlflow ui --backend-store-uri file:./mlruns`), and to `runs.csv` when it is not, so the
-pipeline never depends on MLflow being present.
+`error_analysis.md`. Experiments log to MLflow when it is installed, and to `runs.csv` when it is not, so the
+pipeline never depends on MLflow being present. To browse the tracked runs:
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+SQLite rather than the usual `./mlruns` directory, because MLflow 3.x refuses the
+filesystem backend and raises instead of tracking.
 
 ### Example input and output
 

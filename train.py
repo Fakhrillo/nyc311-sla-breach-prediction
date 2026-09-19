@@ -53,12 +53,19 @@ QUICK = {"baseline_prior": [{}], "baseline_type": [{}], "hgb": [EXPERIMENTS["hgb
 
 
 def _mlflow():
-    """MLflow if available, None otherwise. Optional on purpose: a marker missing
-    from a grader's Colab should not stop the project from running."""
+    """MLflow if available, None otherwise. Optional on purpose: a tracker missing
+    from a grader's Colab should not stop the project from running.
+
+    SQLite rather than the usual `file:./mlruns`. MLflow 3.x refuses the
+    filesystem backend outright ("in maintenance mode") and raises, so the old
+    URI meant this function silently returned None on every modern install and
+    nothing was ever tracked. SQLite is the supported local backend and needs no
+    server.
+    """
     try:
         import mlflow
 
-        mlflow.set_tracking_uri(f"file:{S.ROOT / 'mlruns'}")
+        mlflow.set_tracking_uri(f"sqlite:///{S.ROOT / 'mlflow.db'}")
         mlflow.set_experiment("gov02-sla-breach")
         return mlflow
     except Exception:

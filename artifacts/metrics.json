@@ -37,7 +37,7 @@
     {
       "model": "baseline_prior",
       "params": "{}",
-      "fit_seconds": 0.3,
+      "fit_seconds": 0.4,
       "pr_auc": 0.2559937806283231,
       "roc_auc": 0.5,
       "recall_at_20pct": 0.2101952277657267,
@@ -69,7 +69,7 @@
     {
       "model": "logreg",
       "params": "{\"C\": 1.0}",
-      "fit_seconds": 3.8,
+      "fit_seconds": 2.8,
       "pr_auc": 0.3721017785219965,
       "roc_auc": 0.6361096087434606,
       "recall_at_20pct": 0.3019522776572668,
@@ -85,7 +85,7 @@
     {
       "model": "hgb",
       "params": "{\"learning_rate\": 0.1, \"max_iter\": 200, \"max_leaf_nodes\": 31}",
-      "fit_seconds": 3.2,
+      "fit_seconds": 4.5,
       "pr_auc": 0.43456704376765876,
       "roc_auc": 0.6936768688184218,
       "recall_at_20pct": 0.3448481561822126,
@@ -101,7 +101,7 @@
     {
       "model": "hgb",
       "params": "{\"learning_rate\": 0.05, \"max_iter\": 400, \"max_leaf_nodes\": 63, \"min_samples_leaf\": 50}",
-      "fit_seconds": 9.3,
+      "fit_seconds": 12.9,
       "pr_auc": 0.43026912858226596,
       "roc_auc": 0.6927181642566475,
       "recall_at_20pct": 0.34370932754880695,
@@ -117,7 +117,7 @@
     {
       "model": "hgb",
       "params": "{\"l2_regularization\": 1.0, \"learning_rate\": 0.05, \"max_iter\": 600, \"max_leaf_nodes\": 63}",
-      "fit_seconds": 13.3,
+      "fit_seconds": 16.9,
       "pr_auc": 0.4258361399823103,
       "roc_auc": 0.689934135617559,
       "recall_at_20pct": 0.3418112798264642,
@@ -133,7 +133,7 @@
     {
       "model": "rf",
       "params": "{}",
-      "fit_seconds": 7.6,
+      "fit_seconds": 7.5,
       "pr_auc": 0.42190449526540963,
       "roc_auc": 0.6860134478257897,
       "recall_at_20pct": 0.34441431670281997,

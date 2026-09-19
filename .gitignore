@@ -1,6 +1,7 @@
 # ~73 MB, downloaded from the NYC Open Data API on first run (src/sla.py: fetch)
 data/*.csv
 mlruns/
+mlflow.db
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
