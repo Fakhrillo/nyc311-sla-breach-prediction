@@ -475,12 +475,24 @@ def recall_at_capacity(y_true, scores, capacity: float = 0.20) -> float:
     This is the metric the client would actually care about. PR-AUC summarises
     the whole ranking; a supervisor has room for 20% of the morning's arrivals
     and wants to know what that 20% buys them.
+
+    Cases tied at the cut-off are shared out in proportion, which is the expected
+    recall if the tied cases were picked at random. The first version just took
+    the top k of an argsort, so a ranker with few distinct scores got whatever
+    order the sort left its ties in. The type-rate baseline has 12 distinct
+    scores and about 11,000 cases tied at the 20% cut-off, and its figure came
+    out 0.2467 on a Mac and 0.2520 on Colab. The final model has one case at the
+    cut-off, so its figure never moved.
     """
-    y_true = np.asarray(y_true)
-    k = max(1, int(len(scores) * capacity))
-    top = np.argsort(np.asarray(scores))[::-1][:k]
+    y_true, scores = np.asarray(y_true), np.asarray(scores)
     total = y_true.sum()
-    return float(y_true[top].sum() / total) if total else float("nan")
+    if not total:
+        return float("nan")
+    k = max(1, int(len(scores) * capacity))
+    cut = np.sort(scores)[::-1][k - 1]
+    above, tied = scores > cut, scores == cut
+    caught = y_true[above].sum() + (k - above.sum()) / tied.sum() * y_true[tied].sum()
+    return float(caught / total)
 
 
 def evaluate(y_true, scores, threshold: float = 0.5) -> dict:

@@ -188,12 +188,12 @@ All scored on validation. `baseline_type` predicts each request type's historica
 
 | Model | PR-AUC | ROC-AUC | Recall@20% | Brier | Fit |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline, prior | 0.2560 | 0.5000 | 0.210 | 0.1905 | 0.4 s |
-| Baseline, type rate | 0.3032 | 0.5697 | 0.250 | 0.1894 | 0.1 s |
-| Logistic regression | 0.3721 | 0.6361 | 0.302 | 0.2320 | 2.8 s |
-| **HistGradientBoosting (lr 0.1, 200 it)** | **0.4346** | **0.6937** | **0.345** | **0.1729** | 4.5 s |
-| HistGradientBoosting (lr 0.05, 400 it) | 0.4303 | 0.6927 | 0.344 | 0.1734 | 12.9 s |
-| HistGradientBoosting (lr 0.05, 600 it) | 0.4258 | 0.6899 | 0.342 | 0.1740 | 16.9 s |
+| Baseline, prior | 0.2560 | 0.5000 | 0.200 | 0.1905 | 0.3 s |
+| Baseline, type rate | 0.3032 | 0.5697 | 0.252 | 0.1894 | 0.1 s |
+| Logistic regression | 0.3721 | 0.6361 | 0.302 | 0.2320 | 2.9 s |
+| **HistGradientBoosting (lr 0.1, 200 it)** | **0.4346** | **0.6937** | **0.345** | **0.1729** | 3.9 s |
+| HistGradientBoosting (lr 0.05, 400 it) | 0.4303 | 0.6927 | 0.344 | 0.1734 | 9.4 s |
+| HistGradientBoosting (lr 0.05, 600 it) | 0.4258 | 0.6899 | 0.342 | 0.1740 | 13.8 s |
 | Random forest | 0.4219 | 0.6860 | 0.344 | 0.1749 | 7.5 s |
 
 Fit times are from the committed `runs.csv` and vary by machine.
@@ -221,16 +221,22 @@ The test set was scored once, after the model and threshold were both fixed on v
 | --- | ---: | ---: | --- |
 | PR-AUC | **0.4016** | 0.2794 | 1.44× |
 | ROC-AUC | **0.6747** | 0.5516 | |
-| Recall @ 20% capacity | **0.3357** | 0.2467 | |
-| Recall @ 10% capacity | **0.1913** | 0.1333 | |
+| Recall @ 20% capacity | **0.3357** | 0.2457 | |
+| Recall @ 10% capacity | **0.1913** | 0.1339 | |
 | Brier score | **0.1714** | 0.1840 | lower is better |
 | Precision @ threshold | 0.4158 | — | vs 0.245 base rate |
 | Recall @ threshold | 0.3226 | — | |
 
 In terms the service centre would care about: spending the expediting budget on the model's
-top 20% catches 33.6% of all breaches, against 24.7% for ranking by request type alone and
+top 20% catches 33.6% of all breaches, against 24.6% for ranking by request type alone and
 20% for expediting at random. Of the cases it flags, 41.6% do breach, against a 24.5% base
 rate. That is a 1.7× concentration of supervisor attention.
+
+Recall at capacity shares out cases tied at the cut-off in proportion. That matters for the
+baseline: it gives only 12 distinct scores, so about 11,000 cases tie at the 20% line, and
+before ties were handled its figure depended on how the sort happened to order them. It came
+out 0.2467 on a Mac and 0.2520 on Colab for the same data. The model's scores are
+effectively unique, so its figures never moved.
 
 A ROC-AUC of 0.67 is modest and I want to be direct about that rather than dress it up. It is
 close to the honest ceiling once the request type has been neutralised by construction. A

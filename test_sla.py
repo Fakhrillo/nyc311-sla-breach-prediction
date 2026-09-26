@@ -133,6 +133,20 @@ def test_recall_at_capacity():
     assert S.recall_at_capacity(y, -good, 0.20) == 0.0
 
 
+def test_recall_at_capacity_does_not_depend_on_tie_order():
+    # A ranker with few distinct scores ties many cases at the cut-off, and the
+    # figure must not depend on the order the sort happens to leave them in.
+    y = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+    s = np.array([.9, .5, .5, .5, .1, .1, .1, .1, .1, .1])
+    # One sure pick (0.9, a breach) plus one of the three tied at 0.5, one of
+    # which is a breach: expected catch 1 + 1/3 out of 2 breaches.
+    assert abs(S.recall_at_capacity(y, s, 0.20) - (1 + 1 / 3) / 2) < 1e-12
+    perm = np.random.default_rng(0).permutation(len(y))
+    assert S.recall_at_capacity(y[perm], s[perm], 0.20) == S.recall_at_capacity(y, s, 0.20)
+    # A ranker that cannot tell cases apart catches exactly its share.
+    assert abs(S.recall_at_capacity(y, np.full(10, .3), 0.20) - 0.20) < 1e-12
+
+
 def test_threshold_at_capacity_flags_that_share():
     scores = np.linspace(0, 1, 1000)
     flagged = (scores >= S.threshold_at_capacity(scores, 0.20)).mean()
