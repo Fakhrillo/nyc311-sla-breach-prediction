@@ -4,6 +4,8 @@
 **Track:** Field-Based Scenario, GOV-02 (GovTech)
 **Client:** Government service centre / municipal 311 operation
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Fakhrillo/nyc311-sla-breach-prediction/blob/main/demo.ipynb)
+
 ---
 
 ## Problem statement
@@ -29,17 +31,17 @@ threshold further down.
 | Target | `y = 1` if the case took longer to close than its type's service window |
 | Input at inference | Request type, descriptor, agency, borough, intake channel, location and address type, arrival timestamp, and the agency's queue state on arrival |
 | Output | Breach probability, the service window it is judged against, and a flag for the expediting budget |
-| Success criterion | Beat the request type's own historical breach rate, not just the prior |
+| Success criterion | On the chronological test set: beat the type-rate baseline on recall at 20% capacity (primary) and on PR-AUC, with a Brier score no worse than the no-skill prior |
 
 ## Dataset
 
 NYC 311 Service Requests, pulled from the NYC Open Data (Socrata) API. No key, no login.
 
 - Scope: 1 Jan to 30 Mar 2024, and the 12 request types making up roughly 60% of volume
-- 481,212 cases kept, scanned out of 786,857 in the window
+- 481,212 cases kept out of 786,853 scanned
 - Agencies: NYPD (279,086), HPD (182,509), DOT (18,757), DOB (860)
-- 0.14% still open at the snapshot; 0.81% have unusable durations, meaning closure logged
-  before intake or an auto-close within seconds
+- 0.14% still open at the snapshot (658 cases), and a further 0.67% with impossible
+  durations (3,225): closure logged before intake, or an auto-close within seconds
 - Licence: NYC Open Data, public domain. The download excludes addresses and coordinates,
   so no personal identifiers enter the repository.
 
@@ -56,8 +58,13 @@ sorting by `unique_key` or by `:id` hangs for the full 90 seconds and returns no
 rules out offset paging, because `$offset` without a sort is unsafe. The server is free to
 repeat or skip rows between pages and nothing in the response would tell you. Paging by
 consecutive date windows avoids the problem entirely: the date column is indexed, it is fast,
-and the windows provably cover the period exactly once. The fetcher also raises if any window
-comes back at the 50k row cap, since that would mean cases were silently dropped.
+and the windows cover the period exactly once. The fetcher also raises if any window comes
+back at the 50k row cap, since that would mean cases were silently dropped.
+
+Getting "exactly once" right took a second attempt. The first version built its 3-day windows
+with a grid that stopped short of 1 April, so 31 March was never downloaded and nothing
+complained. That is why the scope above ends on 30 March. The window builder now always
+reaches the end date, and `test_sla.py` pins it.
 
 An `IN(...)` clause over twelve request types makes Socrata scan the table and time out too,
 so the type filter runs client-side on each chunk instead.
@@ -181,13 +188,15 @@ All scored on validation. `baseline_type` predicts each request type's historica
 
 | Model | PR-AUC | ROC-AUC | Recall@20% | Brier | Fit |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline, prior | 0.2560 | 0.5000 | 0.210 | 0.1905 | 0.3 s |
+| Baseline, prior | 0.2560 | 0.5000 | 0.210 | 0.1905 | 0.4 s |
 | Baseline, type rate | 0.3032 | 0.5697 | 0.250 | 0.1894 | 0.1 s |
-| Logistic regression | 0.3721 | 0.6361 | 0.302 | 0.2320 | 3.8 s |
-| **HistGradientBoosting (lr 0.1, 200 it)** | **0.4346** | **0.6937** | **0.345** | **0.1729** | 3.2 s |
-| HistGradientBoosting (lr 0.05, 400 it) | 0.4303 | 0.6927 | 0.344 | 0.1734 | 9.3 s |
-| HistGradientBoosting (lr 0.05, 600 it) | 0.4258 | 0.6899 | 0.342 | 0.1740 | 13.3 s |
-| Random forest | 0.4219 | 0.6860 | 0.344 | 0.1749 | 7.6 s |
+| Logistic regression | 0.3721 | 0.6361 | 0.302 | 0.2320 | 2.8 s |
+| **HistGradientBoosting (lr 0.1, 200 it)** | **0.4346** | **0.6937** | **0.345** | **0.1729** | 4.5 s |
+| HistGradientBoosting (lr 0.05, 400 it) | 0.4303 | 0.6927 | 0.344 | 0.1734 | 12.9 s |
+| HistGradientBoosting (lr 0.05, 600 it) | 0.4258 | 0.6899 | 0.342 | 0.1740 | 16.9 s |
+| Random forest | 0.4219 | 0.6860 | 0.344 | 0.1749 | 7.5 s |
+
+Fit times are from the committed `runs.csv` and vary by machine.
 
 ### Final model, and why that one
 
@@ -302,7 +311,90 @@ The model learns the queue that existed, including whatever bias was already in 
 Agency coverage is uneven. DOB contributes 860 cases, far too few to say anything about.
 
 Process changes break it. If an agency reorganises its intake or triage rules, the historical
-relationship between queue state and delay stops holding.
+relationship between queue state and delay stops holding. What to do about that is answered
+under question 4 below.
+
+## Responses to the GOV-02 brief
+
+The brief asks for a Data & Problem Discovery table (§5), a Technical Proposal (§6), and
+answers to six questions it says must be resolved (§11). They are collected here in the
+brief's own structure; the sections above carry the detail.
+
+### §5 Data & Problem Discovery
+
+| Decision / question | Response |
+| --- | --- |
+| Selected dataset and source | NYC 311 Service Requests (`erm2-nwe9`) from the NYC Open Data API, public domain. 1 Jan to 30 Mar 2024, the 12 request types making up ~60% of volume: 481,212 cases. |
+| What one record represents | One citizen service request, from intake to closure. |
+| Proposed target | `y = 1` if the case took longer to close than the 75th percentile of resolution time for its own request type, fitted on the training period only. The city's own `due_date` is populated for 0.53% of cases, so it cannot be the target. |
+| Information available at prediction time | Request type and descriptor, agency, borough, intake channel, location and address type, arrival time, and the agency's queue at that moment: open backlog and 7-day intake volume. |
+| Main data quality issues | No usable deadlines (0.53%). 0.14% of cases still open at the snapshot; 0.67% with impossible durations. Location type missing for 2.69%, intake channel recorded as UNKNOWN for 2.77%, ZIP missing for 0.12%. No duplicate case IDs and no unparseable timestamps. |
+| How missing data is handled | Categorical gaps become an explicit UNKNOWN category, so missingness is itself something the model can use. Missing ZIP becomes the `has_zip` flag. Impossible durations become unknown rather than zero, and open cases are labelled by the censoring rule in `apply_sla()`. Numeric features are derived from timestamps and the queue, so they are never missing. |
+| Potential leakage risks | Outcome columns (`closed_date`, `status`, `resolution_description`, `resolution_action_updated_date`); service windows fitted on the period being scored; a backlog count that lets future closures empty the queue; a random split. All four are designed out, and the outcome columns, the backlog and the split are each pinned by a test. |
+| Privacy, fairness and licensing | Public-domain data. Addresses, coordinates and free text are excluded at download. Borough is kept deliberately so the fairness gap can be measured. |
+
+### §6 Technical Proposal
+
+| Decision / question | Response |
+| --- | --- |
+| ML problem formulation | Binary classification, used as a ranking problem under a fixed expediting capacity. |
+| Proposed baseline | Two: the class prior, and each request type's historical breach rate. The second is the one that matters, because the target makes request type nearly uninformative by design. |
+| Modelling approaches investigated | Logistic regression, histogram gradient boosting in three configurations, and a random forest. |
+| Splitting and validation | Chronological on arrival date, cut on whole days, ~70/15/15. The test set is scored once. A random split is run only as an ablation, and overstates PR-AUC by 19%. |
+| Primary metric and why | Recall at 20% capacity: a supervisor can expedite a fixed share of arrivals, and the question is what that share catches. PR-AUC summarises the ranking overall; Brier checks the probabilities, because a person is shown them. Accuracy is not used: at a 25% base rate it rewards calling everything on time. |
+| Expected inference input | One intake record. `created_date`, `complaint_type`, `agency` and `borough` are required; channel, descriptor, location and address type, ZIP and queue counts are optional. |
+| Expected inference output | Breach probability, the service window the case is judged against, a low / medium / high risk band, and whether it clears the expediting threshold. |
+| Main technical risks and assumptions | The target is defined rather than given. One quarter of data. Queue behaviour may not survive process changes. Recall is unequal across boroughs. |
+
+### §11 Questions the brief says must be resolved
+
+**1. Is classification or processing-time prediction more useful here?** Classification. The
+decision a supervisor makes is binary, expedite or not, and a per-type window turns "how long"
+into "longer than usual for its kind", which is the question they act on. Processing time is
+also a poor regression target in this data: the fitted windows run from 0.9 hours to 1,032,
+so a single error scale across a noise complaint and a water leak is hard to read, and the
+long housing cases would dominate it. Regression stays in Next steps as a complement, not a
+replacement.
+
+**2. When exactly should the system make a prediction?** At intake, the moment a case is
+filed, using only what the queue knows at that instant. That is the earliest point a
+supervisor could act, and it is what keeps every feature causal.
+
+**3. Which variables may leak the final delay outcome?** The four outcome columns listed
+above, all written as or after a case resolves, all excluded. Two subtler routes matter just
+as much: service windows fitted on the period being scored, and a backlog count that lets
+future closures empty the queue. Windows are fitted on training data only, and the backlog is
+computed as known at arrival.
+
+**4. What should happen if historical process rules change?** The model assumes queue state
+relates to delay the way it did in Q1 2024, and a change to intake or triage rules breaks
+that. The response has three parts. Watch for it: the fixed threshold should keep flagging
+about 20% of arrivals (it flags 19.0% on the test period), so a sustained drift in that share
+is the first signal, and recall at 20% on newly closed cases is the second. That second
+signal lags, because a case cannot be labelled until its window has passed, which is up to 43
+days for a water leak. Once a change is confirmed, refit the service windows and retrain on
+post-change data only. Until there is enough of it, fall back to the type-rate baseline, which
+needs far less history.
+
+Changing *workload* is a different matter from changing *rules*. Backlog and recent intake
+volume are inputs, so a surge moves the scores directly without retraining, as long as it
+stays within the range the model saw in training.
+
+**5. Which errors create the greatest operational cost?** A missed breach: a case that runs
+late and nobody chased, which is the failure the system exists to prevent, and a resident
+bears it. A false alarm costs supervisor attention instead, but with fixed capacity every false
+alarm also takes a slot from a case that would have breached. So under a fixed budget both
+errors come down to the same currency, breaches not caught, which is why the threshold is set
+by capacity rather than a cost ratio and why recall at 20% is the headline metric. The cost is
+not spread evenly either: the model misses the largest share of breaches in HPD housing cases
+(recall 0.217) and in Brooklyn (0.138).
+
+**6. How is fairness evaluated across regions and departments?** Recall of the expediting
+flag, computed on the test set per borough, per agency and per intake channel, and regenerated
+into `artifacts/error_analysis.md` on every training run. Recall is the right measure because
+the harm is a breach nobody chased. Results: borough 0.138 to 0.576, agency 0.217 (HPD) to
+0.666 (DOT), channel 0.289 (phone) to 0.565 (unknown). What to do about the borough gap is
+set out under Responsible AI.
 
 ## Repository
 
@@ -312,8 +404,9 @@ nyc311-sla-breach-prediction/
 ├── requirements.txt
 ├── demo.ipynb                  ← reproducible Colab demo, run this first
 ├── train.py                    ← experiments → final model → test report
-├── test_sla.py                 ← 11 assertions guarding the leakage-critical logic
+├── test_sla.py                 ← 12 tests guarding the leakage-critical logic
 ├── src/sla.py                  ← API download, features, target, models, inference
+├── AGENTS.md                   ← working conventions for this repo
 ├── data/                       ← CSV downloaded on first run (gitignored, ~73 MB)
 └── artifacts/
     ├── model.joblib            ← pipeline + threshold + fitted SLA windows + metrics
@@ -326,27 +419,37 @@ nyc311-sla-breach-prediction/
 
 ### Colab, which is the demo
 
-Open `demo.ipynb` in Colab (File → Open notebook → GitHub → this repo) and run all. It
-queries the API, downloads the slice, trains, evaluates on unseen data and scores example
-cases. Nothing needs to be uploaded.
+Click the **Open in Colab** badge at the top, or open `demo.ipynb` in Colab via File → Open
+notebook → GitHub → this repo, then run all. It queries the API, downloads the slice, trains,
+evaluates on unseen data and scores example cases. Nothing needs to be uploaded.
+
+Almost all of the runtime is the data download, and that depends on how busy the NYC API is.
+In a clean run on 26 September the download took about 13 minutes and every other cell
+together took under a minute. Within the same Colab session the CSV is cached, so running the
+notebook a second time skips the download.
 
 ### Local
 
 ```bash
 pip install -r requirements.txt
 
-python test_sla.py      # 11 assertions, ~3 s
+python test_sla.py      # 12 tests, ~3 s
 python train.py         # ~1 min once the data is cached; --quick for a smoke test
 ```
 
-The first run downloads about 73 MB from the NYC Open Data API, which takes two to three
-minutes. `train.py` writes `artifacts/model.joblib`, `metrics.json`, `runs.csv` and
-`error_analysis.md`. Experiments log to MLflow when it is installed, and to `runs.csv` when it is not, so the
-pipeline never depends on MLflow being present. To browse the tracked runs:
+The first run downloads about 73 MB from the NYC Open Data API, which takes anywhere from a
+few minutes to over ten depending on API load. `train.py` writes `artifacts/model.joblib`, `metrics.json`, `runs.csv` and
+`error_analysis.md`. Every experiment is logged to MLflow when it is installed, and always to
+`runs.csv`, so the pipeline never depends on MLflow being present.
+
+To browse the tracked runs after training:
 
 ```bash
 mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
+
+The store itself is not committed. MLflow writes absolute paths from the machine that ran it
+into the database, so `runs.csv` is the committed copy of the same parameters and metrics.
 
 SQLite rather than the usual `./mlruns` directory, because MLflow 3.x refuses the
 filesystem backend and raises instead of tracking.

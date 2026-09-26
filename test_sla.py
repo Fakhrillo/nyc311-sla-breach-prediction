@@ -108,6 +108,17 @@ def test_split_is_chronological_and_whole_days():
     assert not days(tr) & days(va) and not days(va) & days(te), "a day must not straddle two sets"
 
 
+def test_download_windows_cover_the_whole_period():
+    # 1 Jan to 31 Mar is 91 days, not a multiple of 3. The old grid stopped at
+    # 31 Mar 00:00 and silently never fetched the last day.
+    w = S._windows("2024-01-01", "2024-03-31", 3)
+    assert w[0][0] == pd.Timestamp("2024-01-01")
+    assert w[-1][1] == pd.Timestamp("2024-04-01"), w[-1]
+    assert all(a[1] == b[0] for a, b in zip(w, w[1:])), "windows must be contiguous"
+    # The shipped window lands on the grid, so the download itself is unchanged.
+    assert S._windows(*S.WINDOW, 3)[-1][1] == pd.Timestamp("2024-03-31")
+
+
 def test_outcome_columns_are_not_features():
     for col in S.LEAKY_COLUMNS:
         assert col not in S.FEATURES, col

@@ -26,7 +26,14 @@ ARTIFACTS = ROOT / "artifacts"
 MODEL_PATH = ARTIFACTS / "model.joblib"
 
 ENDPOINT = "https://data.cityofnewyork.us/resource/erm2-nwe9.csv"
-WINDOW = ("2024-01-01", "2024-03-31")
+
+# Inclusive. Q1 2024 minus 31 March: the original download built its 3-day
+# windows with a grid that stopped short of 1 April, so 31 March was never
+# fetched, and every reported number comes from 1 Jan to 30 Mar. The end date
+# now says so instead of claiming a day the data does not contain. _windows()
+# no longer drops a tail, and 30 March lands on the grid, so the download is
+# byte-for-byte what it was.
+WINDOW = ("2024-01-01", "2024-03-30")
 
 # The 12 request types that make up roughly 60% of Q1 2024 volume.
 #
@@ -101,6 +108,21 @@ MIN_RESOLUTION_HOURS = 0.02
 # ============================================================== getting the data
 
 
+def _windows(start, end, chunk_days: int) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Consecutive [lo, hi) windows covering `start` to `end` inclusive, exactly once.
+
+    pd.date_range alone stops at the last point on the chunk grid, which silently
+    drops the tail whenever the period is not a multiple of `chunk_days`. That is
+    how 31 March went missing. Appending the true end closes the gap; the last
+    window is simply shorter.
+    """
+    stop = pd.Timestamp(end) + pd.Timedelta(days=1)
+    edges = pd.date_range(start, stop, freq=f"{chunk_days}D")
+    if edges[-1] < stop:
+        edges = edges.append(pd.DatetimeIndex([stop]))
+    return list(zip(edges[:-1], edges[1:]))
+
+
 def fetch(path: Path | str = DATA, chunk_days: int = 3, retries: int = 4) -> Path:
     """Download the scoped slice from the NYC Open Data API.
 
@@ -116,8 +138,9 @@ def fetch(path: Path | str = DATA, chunk_days: int = 3, retries: int = 4) -> Pat
     Filtering `complaint_type` server-side with `IN(...)` over twelve values makes
     Socrata scan the table, and that times out too.
 
-    Consecutive date windows are indexed, fast, and provably cover the period
-    exactly once. The type filter runs client-side on each chunk as it arrives.
+    Consecutive date windows are indexed, fast, and cover the period exactly
+    once (see _windows(), and the test that pins it). The type filter runs
+    client-side on each chunk as it arrives.
     """
     import time
     import urllib.error
@@ -130,11 +153,9 @@ def fetch(path: Path | str = DATA, chunk_days: int = 3, retries: int = 4) -> Pat
     path.parent.mkdir(parents=True, exist_ok=True)
 
     scope = {t.upper() for t in SCOPE_TYPES}
-    edges = pd.date_range(WINDOW[0], pd.Timestamp(WINDOW[1]) + pd.Timedelta(days=1),
-                          freq=f"{chunk_days}D")
     frames, scanned = [], 0
 
-    for lo, hi in zip(edges[:-1], edges[1:]):
+    for lo, hi in _windows(*WINDOW, chunk_days):
         query = urllib.parse.urlencode(
             {
                 "$select": ",".join(PULL_COLUMNS),

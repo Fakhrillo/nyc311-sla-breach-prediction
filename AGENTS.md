@@ -23,14 +23,16 @@ code has to be explainable, not just correct.
 - **Never write a number into the README, a docstring or a notebook that was not produced by
   running the code.** If a metric changes, re-run `train.py` and copy the new value. Inventing
   or adjusting results fails the whole capstone outright (evaluation criteria §6).
-- After any change to `src/sla.py` or `train.py`, run `python test_sla.py` (11 assertions,
+- After any change to `src/sla.py` or `train.py`, run `python test_sla.py` (12 tests,
   ~3 s). After a change touching features, the target or the split, re-run `train.py` and
   confirm the reported metrics still match the README.
 - The test set is scored once, in `train.py`, after the model and threshold are fixed on
   validation. No other code path should touch it.
 - Preprocessing stays inside the sklearn Pipeline. Nothing gets fitted on the dataframe
   outside it.
-- `data/*.csv` and `mlruns/` stay out of git. The dataset is ~73 MB and re-downloadable.
+- `data/*.csv`, `mlflow.db` and `mlruns/` stay out of git. The dataset is ~73 MB and
+  re-downloadable; MLflow bakes absolute local paths into its store, so `artifacts/runs.csv`
+  is the committed record of every run. Check any new binary for local paths before committing.
 
 ## Git conventions
 

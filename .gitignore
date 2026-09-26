@@ -1,6 +1,8 @@
 # ~73 MB, downloaded from the NYC Open Data API on first run (src/sla.py: fetch)
 data/*.csv
 mlruns/
+# MLflow writes absolute local paths into its store, so the committed record is
+# artifacts/runs.csv instead. train.py regenerates this on every run.
 mlflow.db
 __pycache__/
 *.pyc
