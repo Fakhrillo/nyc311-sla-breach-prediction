@@ -220,7 +220,10 @@ All scored on validation. `baseline_type` predicts each request type's historica
 | HistGradientBoosting (lr 0.05, 600 it) | 0.4141 | 0.6880 | 0.344 | 0.1709 | 11.4 s |
 | Random forest | 0.4143 | 0.6874 | 0.352 | 0.1710 | 6.9 s |
 
-Fit times are from the committed `runs.csv` and vary by machine.
+Fit times are from the committed `runs.csv` and vary by machine. The random forest's scores
+move slightly too: the same code and seed give PR-AUC 0.4143 in this table, run on a Mac,
+and 0.4135 on Colab. The selected gradient-boosting model and every test figure come out
+identical on both.
 
 On validation the type-rate baseline is no better than the prior, with a ROC-AUC of 0.48.
 That is what the target's design predicts, since every type breaches about 25% of the time in

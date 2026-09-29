@@ -39,7 +39,8 @@ WINDOW = ("2024-01-01", "2024-03-30")
 #
 # Scoping to these means each per-type service window is estimated from thousands
 # of cases instead of a handful, and they still cover four agencies doing very
-# different work: NYPD parking calls, HPD heating repairs, DSNY, DOT.
+# different work: NYPD parking and noise calls, HPD housing repairs, DOT street
+# repairs, and a few hundred DOB cases.
 SCOPE_TYPES = [
     "Illegal Parking",
     "HEAT/HOT WATER",
