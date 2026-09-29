@@ -139,7 +139,7 @@ its latest `closed_date`, 8 July 2026, is a lower bound (`extract_time()`). By t
 open cases had been open for more than two years, far past the longest window of 43 days, so
 every one is a known breach and none is left unknown. The earlier version took the last
 *intake* time, 30 March 2024, as if the data had been pulled the moment intake stopped, and
-dropped 172 open cases as "unknown" that were in fact two years overdue.
+dropped 78 open cases as "unknown" that were in fact two years overdue.
 
 ## Pipeline
 
