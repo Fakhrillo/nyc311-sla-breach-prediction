@@ -4,6 +4,10 @@
 **Track:** Field-Based Scenario, GOV-02 (GovTech)
 **Client:** Government service centre / municipal 311 operation
 
+**Quick demo**, loads the trained model and scores cases in under a minute:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Fakhrillo/nyc311-sla-breach-prediction/blob/main/quick_demo.ipynb)
+
+**Full reproducible pipeline**, download to evaluation, 10 to 15 minutes mostly downloading:
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Fakhrillo/nyc311-sla-breach-prediction/blob/main/demo.ipynb)
 
 ---
@@ -28,7 +32,7 @@ threshold further down.
 | --- | --- |
 | Task type | Binary classification, used as a ranking problem |
 | One record | One service request, scored at the moment it is filed |
-| Target | `y = 1` if the case took longer to close than its type's service window |
+| Target | `y = 1` if the case took longer to close than its type's service window, a proxy derived in this project rather than NYC's official SLA |
 | Input at inference | Request type, descriptor, agency, borough, intake channel, location and address type, arrival timestamp, and the agency's queue state on arrival |
 | Output | Breach probability, the service window it is judged against, and a flag for the expediting budget |
 | Success criterion | On the chronological test set: beat the type-rate baseline on recall at 20% capacity (primary) and on PR-AUC, with a Brier score no worse than the no-skill prior |
@@ -38,10 +42,11 @@ threshold further down.
 NYC 311 Service Requests, pulled from the NYC Open Data (Socrata) API. No key, no login.
 
 - Scope: 1 Jan to 30 Mar 2024, and the 12 request types making up roughly 60% of volume
-- 481,212 cases kept out of 786,853 scanned
+- 481,212 cases kept out of 786,853 scanned, of which 477,987 are labelled
 - Agencies: NYPD (279,086), HPD (182,509), DOT (18,757), DOB (860)
-- 0.14% still open at the snapshot (658 cases), and a further 0.67% with impossible
-  durations (3,225): closure logged before intake, or an auto-close within seconds
+- 0.14% still open when the data was extracted (658 cases), all of them labelled, and a
+  further 0.67% with impossible durations (3,225): closure logged before intake, or an
+  auto-close within seconds. Those are dropped before labelling.
 - Licence: NYC Open Data, public domain. The download excludes addresses and coordinates,
   so no personal identifiers enter the repository.
 
@@ -75,6 +80,10 @@ NYC 311 publishes a `due_date` column. It would be the ideal target, and it is p
 0.53% of Q1 2024 cases (4,168 out of 786,857). The city's own SLA field is abandoned in
 practice, so the service window has to be defined here instead.
 
+So a word on the name. "SLA" in this project's title means that derived window: a proxy for a
+service commitment, built from how long cases of each type historically took. It is not
+NYC's official SLA, and nothing here should be read as the city's own deadline.
+
 The definition I settled on: a case breaches if it took longer than the 75th percentile of
 resolution time for its own request type, measured on the training period only.
 
@@ -107,27 +116,42 @@ queue state, geography, channel and timing instead.
 This is also why the headline comparison is against a type-rate baseline rather than the
 prior. Beating the prior here would prove nothing.
 
-### Censoring is handled rather than dropped
+### Open cases, impossible durations, and the snapshot
 
-A case still open at the snapshot is not automatically unlabelled. If it has already been
-open longer than its window then it has breached, whatever happens next. Only a case that is
-still open *and* still inside its window is genuinely unknown, and only those get dropped.
+Three kinds of record have to be told apart, and `apply_sla()` does it by `closed_date`, never
+by a missing duration:
 
-The tempting shortcut is to drop every open case, and it would have been a self-serving one:
-cases still open after weeks are precisely the slow cases the client cares about. Dropped as
-genuinely unknown: 6 train, 18 validation, 148 test.
+- **Closed, with a usable duration.** A breach if it took longer than its window.
+- **Closed, with an impossible duration**: closed before it opened, or auto-closed within
+  seconds. There is no real outcome to learn from, so these are dropped before labelling:
+  1,765 train, 839 validation, 621 test. An earlier version blanked the duration and let
+  these fall through as "still open", which labelled every one of them a breach. It was
+  caught in review, and every figure in this README comes from the corrected run. The damage
+  was not spread evenly: 8% of street-condition records are auto-closes, which is most of why
+  that type used to breach 31% of the time instead of 25%.
+- **Still open when the data was pulled.** Dropping these is the tempting shortcut, and a
+  self-serving one: cases still open after weeks are precisely the slow cases the client cares
+  about. A case open longer than its window has breached, whatever happens next.
+
+"Open longer than its window" needs a clock, and the right one is when the extract was taken.
+The CSV carries no pull date, but it cannot contain a closure that had not happened yet, so
+its latest `closed_date`, 8 July 2026, is a lower bound (`extract_time()`). By then all 658
+open cases had been open for more than two years, far past the longest window of 43 days, so
+every one is a known breach and none is left unknown. The earlier version took the last
+*intake* time, 30 March 2024, as if the data had been pulled the moment intake stopped, and
+dropped 172 open cases as "unknown" that were in fact two years overdue.
 
 ## Pipeline
 
 ```
 NYC Open Data API
   └─ fetch()         date-windowed paging, retries, 50k-cap guard
-  └─ clean()         parse timestamps, drop impossible durations, normalise categoricals
+  └─ clean()         parse ISO timestamps, blank impossible durations, normalise categoricals
   └─ add_workload()  backlog + 7-day volumes as known on arrival  ← leakage-critical
   └─ add_calendar()  arrival hour, weekday, weekend
   └─ time_split()    chronological on created_date, whole days, ~70/15/15
   └─ fit_sla()       service windows from the TRAINING period only
-  └─ apply_sla()     breach label, with censoring handled explicitly
+  └─ apply_sla()     breach label: impossible durations dropped, open cases labelled at the snapshot
   └─ make_model()    ColumnTransformer → estimator, one sklearn Pipeline
   └─ evaluate()      PR-AUC, ROC-AUC, recall@capacity, Brier
   └─ predict_one()   validate raw intake dict → features → risk band
@@ -165,9 +189,9 @@ the backlog features straight across the boundary.
 
 | Split | Cases | Arrival dates | Breach rate |
 | --- | ---: | --- | ---: |
-| Train | 335,616 | 2024-01-01 → 2024-03-02 | 0.255 |
-| Validation | 72,033 | 2024-03-03 → 2024-03-16 | 0.256 |
-| Test | 73,391 | 2024-03-17 → 2024-03-30 | 0.245 |
+| Train | 333,857 | 2024-01-01 → 2024-03-02 | 0.251 |
+| Validation | 71,212 | 2024-03-03 → 2024-03-16 | 0.247 |
+| Test | 72,918 | 2024-03-17 → 2024-03-30 | 0.240 |
 
 ### What a random split would have reported
 
@@ -175,8 +199,8 @@ Same model, same features, same target. Only the split changed:
 
 | Split | PR-AUC | ROC-AUC |
 | --- | ---: | ---: |
-| Random (wrong) | 0.4775 | 0.7272 |
-| Chronological (reported) | **0.4016** | **0.6747** |
+| Random (wrong) | 0.4739 | 0.7298 |
+| Chronological (reported) | **0.3990** | **0.6802** |
 
 A 19% overstatement of PR-AUC, out of one line of code. This is the easiest way to inflate a
 project like this one, which is why the number is in the README rather than left out of it,
@@ -188,15 +212,22 @@ All scored on validation. `baseline_type` predicts each request type's historica
 
 | Model | PR-AUC | ROC-AUC | Recall@20% | Brier | Fit |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline, prior | 0.2560 | 0.5000 | 0.200 | 0.1905 | 0.3 s |
-| Baseline, type rate | 0.3032 | 0.5697 | 0.252 | 0.1894 | 0.1 s |
-| Logistic regression | 0.3721 | 0.6361 | 0.302 | 0.2320 | 2.9 s |
-| **HistGradientBoosting (lr 0.1, 200 it)** | **0.4346** | **0.6937** | **0.345** | **0.1729** | 3.9 s |
-| HistGradientBoosting (lr 0.05, 400 it) | 0.4303 | 0.6927 | 0.344 | 0.1734 | 9.4 s |
-| HistGradientBoosting (lr 0.05, 600 it) | 0.4258 | 0.6899 | 0.342 | 0.1740 | 13.8 s |
-| Random forest | 0.4219 | 0.6860 | 0.344 | 0.1749 | 7.5 s |
+| Baseline, prior | 0.2474 | 0.5000 | 0.200 | 0.1862 | 0.3 s |
+| Baseline, type rate | 0.2474 | 0.4831 | 0.179 | 0.1861 | 0.1 s |
+| Logistic regression | 0.3639 | 0.6347 | 0.304 | 0.2308 | 2.8 s |
+| **HistGradientBoosting (lr 0.1, 200 it)** | **0.4198** | **0.6921** | **0.349** | **0.1700** | 3.3 s |
+| HistGradientBoosting (lr 0.05, 400 it) | 0.4197 | 0.6924 | 0.350 | 0.1700 | 7.9 s |
+| HistGradientBoosting (lr 0.05, 600 it) | 0.4141 | 0.6880 | 0.344 | 0.1709 | 11.4 s |
+| Random forest | 0.4143 | 0.6874 | 0.352 | 0.1710 | 6.9 s |
 
 Fit times are from the committed `runs.csv` and vary by machine.
+
+On validation the type-rate baseline is no better than the prior, with a ROC-AUC of 0.48.
+That is what the target's design predicts, since every type breaches about 25% of the time in
+training. Before the impossible-duration fix it looked stronger (PR-AUC 0.303), because the
+mislabelled auto-closes are concentrated in a few request types and handed it a signal that
+was not real. On the test period it keeps a little genuine signal, as the breach rate by type
+drifts from the training period.
 
 ### Final model, and why that one
 
@@ -205,13 +236,13 @@ HistGradientBoostingClassifier with `learning_rate=0.1, max_iter=200, max_leaf_n
 Selection is not plain argmax on PR-AUC. A supervisor is shown a probability, so `train.py`
 first rejects any candidate whose Brier score is worse than the no-skill prior, then takes
 the best PR-AUC among whatever survives. Logistic regression gets rejected on exactly that
-basis, at Brier 0.2320 against a no-skill 0.1905, even though it beats both baselines on
+basis, at Brier 0.2308 against a no-skill 0.1862, even though it beats both baselines on
 ranking. Its ordering is useful; its numbers are not, and 0.8 needs to mean something close
 to 0.8 if anyone is going to act on it.
 
-The smallest gradient-boosting configuration also won outright. The larger ones cost two to
-four times the fit time and scored slightly worse, which says the problem is data-limited
-rather than capacity-limited.
+The smallest gradient-boosting configuration won. The 400-iteration one tied it (PR-AUC
+0.4197 against 0.4198) for more than twice the fit time, and the 600-iteration one scored
+lower, which says the problem is data-limited rather than capacity-limited.
 
 ## Results on unseen test data
 
@@ -219,36 +250,36 @@ The test set was scored once, after the model and threshold were both fixed on v
 
 | Metric | Model | Type-rate baseline | |
 | --- | ---: | ---: | --- |
-| PR-AUC | **0.4016** | 0.2794 | 1.44× |
-| ROC-AUC | **0.6747** | 0.5516 | |
-| Recall @ 20% capacity | **0.3357** | 0.2457 | |
-| Recall @ 10% capacity | **0.1913** | 0.1339 | |
-| Brier score | **0.1714** | 0.1840 | lower is better |
-| Precision @ threshold | 0.4158 | — | vs 0.245 base rate |
-| Recall @ threshold | 0.3226 | — | |
+| PR-AUC | **0.3990** | 0.2658 | 1.50× |
+| ROC-AUC | **0.6802** | 0.5429 | |
+| Recall @ 20% capacity | **0.3401** | 0.2365 | |
+| Recall @ 10% capacity | **0.1912** | 0.1254 | |
+| Brier score | **0.1684** | 0.1820 | lower is better |
+| Precision @ threshold | 0.4062 | — | vs 0.240 base rate |
+| Recall @ threshold | 0.3441 | — | |
 
 In terms the service centre would care about: spending the expediting budget on the model's
-top 20% catches 33.6% of all breaches, against 24.6% for ranking by request type alone and
-20% for expediting at random. Of the cases it flags, 41.6% do breach, against a 24.5% base
+top 20% catches 34.0% of all breaches, against 23.6% for ranking by request type alone and
+20% for expediting at random. Of the cases it flags, 40.6% do breach, against a 24.0% base
 rate. That is a 1.7× concentration of supervisor attention.
 
 Recall at capacity shares out cases tied at the cut-off in proportion. That matters for the
-baseline: it gives only 12 distinct scores, so about 11,000 cases tie at the 20% line, and
-before ties were handled its figure depended on how the sort happened to order them. It came
-out 0.2467 on a Mac and 0.2520 on Colab for the same data. The model's scores are
+baseline: it gives only 12 distinct scores, so about 10,800 cases tie at the 20% line, and
+before ties were handled its figure depended on how the sort happened to order them. On the
+earlier labels it came out 0.2467 on a Mac and 0.2520 on Colab for the same data. The model's scores are
 effectively unique, so its figures never moved.
 
-A ROC-AUC of 0.67 is modest and I want to be direct about that rather than dress it up. It is
+A ROC-AUC of 0.68 is modest and I want to be direct about that rather than dress it up. It is
 close to the honest ceiling once the request type has been neutralised by construction. A
 project reporting 0.85 on this task is almost certainly using a random split, a global
 deadline, or an outcome column.
 
 ### Threshold
 
-The shipped threshold is 0.365, which is the top 20% of validation scores, i.e. the expediting
+The shipped threshold is 0.354, which is the top 20% of validation scores, i.e. the expediting
 budget. Capacity comes first here because supervisor attention exists in fixed supply and does
 not care what a cost ratio says; the question is what that budget buys. Applied to the test
-period it flags 19.0%, which is close but does drift, so it needs periodic recalibration
+period it flags 20.3%, which is close but can drift, so it needs periodic recalibration
 against live score distributions.
 
 ## Error analysis
@@ -256,33 +287,34 @@ against live score distributions.
 Full slice tables are in [`artifacts/error_analysis.md`](artifacts/error_analysis.md),
 regenerated by every training run. The headlines:
 
-DOT is where the model works, at recall 0.666 and precision 0.562 on a 0.364 breach rate.
+DOT is where the model works, at recall 0.655 and precision 0.593 on a 0.325 breach rate.
 Street-condition work has genuine queue dynamics and the features capture them.
 
-HPD is where it struggles, at recall 0.217. Housing cases (heat, plumbing, leaks) run on
+HPD is where it struggles, at recall 0.227. Housing cases (heat, plumbing, leaks) run on
 inspection schedules and landlord-compliance timelines, and nothing visible at intake
 predicts those.
 
-Mid-range backlog is the most predictable band at recall 0.412. Both an empty queue and an
+Mid-range backlog is the most predictable band at recall 0.435. Both an empty queue and an
 overwhelmed one are harder to call than a queue under normal load, which makes intuitive
 sense: in the first case nothing is contended, in the second everything is.
 
-False alarms and missed breaches look almost identical on queue state, at median backlog 352
-against 340. Whatever is left in the errors, it is not a backlog-threshold problem.
+False alarms and missed breaches look almost identical on queue state, at median backlog 349
+against 343. Whatever is left in the errors, it is not a backlog-threshold problem.
 
 ## Responsible AI
 
-Recall varies sharply by borough, from 0.138 in Brooklyn to 0.576 in Queens, a gap of 0.44.
+Recall varies sharply by borough, from 0.151 in Brooklyn to 0.620 in Queens, a gap of 0.47.
 This is the most important number in the project and it is not a good one. Expediting is
 rationed public attention, so a model that surfaces one borough's stalled cases four times
 more often than another's is redistributing municipal service along geographic lines. Nothing
 in the data says Brooklyn's cases are less urgent. It says only that the historical queue
 treated them differently, and the model learned to repeat it.
 
-Intake channel carries the same risk in a different shape. Channel recall spans 0.289 for
-phone to 0.565 for unknown, and if phone reports are escalated less than online ones the
-system quietly penalises whoever is least likely to file online, which typically means older
-and lower-income residents.
+Intake channel carries the same risk in a different shape. Channel recall spans 0.321 for
+online to 0.511 for unknown. Phone and online are close, at 0.326 against 0.321, so the
+failure I was watching for, phone reports escalated less than online ones, does not show in
+this quarter. It still has to be monitored: if it appeared, it would quietly penalise whoever
+is least likely to file online, which typically means older and lower-income residents.
 
 If equal recall across boroughs is required, the budget should be applied per borough rather
 than globally. That is a policy decision for the agency rather than a hyperparameter, and it
@@ -316,6 +348,10 @@ The model learns the queue that existed, including whatever bias was already in 
 
 Agency coverage is uneven. DOB contributes 860 cases, far too few to say anything about.
 
+Labels use every closure known when the data was extracted, two years later. A model retrained
+live would see the most recent weeks' long-running cases still open, so its newest training
+labels would be incomplete. That is one more reason for the monitoring lag under question 4.
+
 Process changes break it. If an agency reorganises its intake or triage rules, the historical
 relationship between queue state and delay stops holding. What to do about that is answered
 under question 4 below.
@@ -330,12 +366,12 @@ brief's own structure; the sections above carry the detail.
 
 | Decision / question | Response |
 | --- | --- |
-| Selected dataset and source | NYC 311 Service Requests (`erm2-nwe9`) from the NYC Open Data API, public domain. 1 Jan to 30 Mar 2024, the 12 request types making up ~60% of volume: 481,212 cases. |
+| Selected dataset and source | NYC 311 Service Requests (`erm2-nwe9`) from the NYC Open Data API, public domain. 1 Jan to 30 Mar 2024, the 12 request types making up ~60% of volume: 481,212 cases, 477,987 of them labelled. |
 | What one record represents | One citizen service request, from intake to closure. |
 | Proposed target | `y = 1` if the case took longer to close than the 75th percentile of resolution time for its own request type, fitted on the training period only. The city's own `due_date` is populated for 0.53% of cases, so it cannot be the target. |
 | Information available at prediction time | Request type and descriptor, agency, borough, intake channel, location and address type, arrival time, and the agency's queue at that moment: open backlog and 7-day intake volume. |
-| Main data quality issues | No usable deadlines (0.53%). 0.14% of cases still open at the snapshot; 0.67% with impossible durations. Location type missing for 2.69%, intake channel recorded as UNKNOWN for 2.77%, ZIP missing for 0.12%. No duplicate case IDs and no unparseable timestamps. |
-| How missing data is handled | Categorical gaps become an explicit UNKNOWN category, so missingness is itself something the model can use. Missing ZIP becomes the `has_zip` flag. Impossible durations become unknown rather than zero, and open cases are labelled by the censoring rule in `apply_sla()`. Numeric features are derived from timestamps and the queue, so they are never missing. |
+| Main data quality issues | No usable deadlines (0.53%). 0.14% of cases still open when extracted; 0.67% with impossible durations, dropped before labelling. Location type missing for 2.69%, intake channel recorded as UNKNOWN for 2.77%, ZIP missing for 0.12%. No duplicate case IDs and no unparseable timestamps. |
+| How missing data is handled | Categorical gaps become an explicit UNKNOWN category, so missingness is itself something the model can use. Missing ZIP becomes the `has_zip` flag. Impossible durations are dropped before labelling, rather than being read as zero or as still open, and open cases are labelled by the censoring rule in `apply_sla()`. Numeric features are derived from timestamps and the queue, so they are never missing. |
 | Potential leakage risks | Outcome columns (`closed_date`, `status`, `resolution_description`, `resolution_action_updated_date`); service windows fitted on the period being scored; a backlog count that lets future closures empty the queue; a random split. All four are designed out, and the outcome columns, the backlog and the split are each pinned by a test. |
 | Privacy, fairness and licensing | Public-domain data. Addresses, coordinates and free text are excluded at download. Borough is kept deliberately so the fairness gap can be measured. |
 
@@ -375,7 +411,7 @@ computed as known at arrival.
 **4. What should happen if historical process rules change?** The model assumes queue state
 relates to delay the way it did in Q1 2024, and a change to intake or triage rules breaks
 that. The response has three parts. Watch for it: the fixed threshold should keep flagging
-about 20% of arrivals (it flags 19.0% on the test period), so a sustained drift in that share
+about 20% of arrivals (it flags 20.3% on the test period), so a sustained drift in that share
 is the first signal, and recall at 20% on newly closed cases is the second. That second
 signal lags, because a case cannot be labelled until its window has passed, which is up to 43
 days for a water leak. Once a change is confirmed, refit the service windows and retrain on
@@ -393,13 +429,13 @@ alarm also takes a slot from a case that would have breached. So under a fixed b
 errors come down to the same currency, breaches not caught, which is why the threshold is set
 by capacity rather than a cost ratio and why recall at 20% is the headline metric. The cost is
 not spread evenly either: the model misses the largest share of breaches in HPD housing cases
-(recall 0.217) and in Brooklyn (0.138).
+(recall 0.227) and in Brooklyn (0.151).
 
 **6. How is fairness evaluated across regions and departments?** Recall of the expediting
 flag, computed on the test set per borough, per agency and per intake channel, and regenerated
 into `artifacts/error_analysis.md` on every training run. Recall is the right measure because
-the harm is a breach nobody chased. Results: borough 0.138 to 0.576, agency 0.217 (HPD) to
-0.666 (DOT), channel 0.289 (phone) to 0.565 (unknown). What to do about the borough gap is
+the harm is a breach nobody chased. Results: borough 0.151 to 0.620, agency 0.227 (HPD) to
+0.655 (DOT), channel 0.321 (online) to 0.511 (unknown). What to do about the borough gap is
 set out under Responsible AI.
 
 ## Repository
@@ -408,9 +444,10 @@ set out under Responsible AI.
 nyc311-sla-breach-prediction/
 ├── README.md
 ├── requirements.txt
-├── demo.ipynb                  ← reproducible Colab demo, run this first
+├── quick_demo.ipynb            ← loads the trained model, scores cases, under a minute
+├── demo.ipynb                  ← full reproducible pipeline on Colab, download to evaluation
 ├── train.py                    ← experiments → final model → test report
-├── test_sla.py                 ← 12 tests guarding the leakage-critical logic
+├── test_sla.py                 ← 15 tests guarding the leakage-critical logic
 ├── src/sla.py                  ← API download, features, target, models, inference
 ├── AGENTS.md                   ← working conventions for this repo
 ├── data/                       ← CSV downloaded on first run (gitignored, ~73 MB)
@@ -423,9 +460,16 @@ nyc311-sla-breach-prediction/
 
 ## Setup and run
 
-### Colab, which is the demo
+### Quick demo, under a minute
 
-Click the **Open in Colab** badge at the top, or open `demo.ipynb` in Colab via File → Open
+[`quick_demo.ipynb`](https://colab.research.google.com/github/Fakhrillo/nyc311-sla-breach-prediction/blob/main/quick_demo.ipynb) clones the repo, loads the trained `artifacts/model.joblib`, scores
+four example cases and shows bad input being rejected. It downloads no data and trains
+nothing, so it is the one to run live. Change any input and re-run the cell to score a
+different case.
+
+### Full reproducible pipeline
+
+Click the **full pipeline** badge at the top, or open `demo.ipynb` in Colab via File → Open
 notebook → GitHub → this repo, then run all. It queries the API, downloads the slice, trains,
 evaluates on unseen data and scores example cases. Nothing needs to be uploaded.
 
@@ -439,7 +483,7 @@ notebook a second time skips the download.
 ```bash
 pip install -r requirements.txt
 
-python test_sla.py      # 12 tests, ~3 s
+python test_sla.py      # 15 tests, ~3 s
 python train.py         # ~1 min once the data is cached; --quick for a smoke test
 ```
 
@@ -475,11 +519,11 @@ S.predict_one({
     "agency_backlog": 9000,
     "agency_7d_volume": 15000,
 })
-# {'breach_probability': 0.273,
+# {'breach_probability': 0.3091,
 #  'service_window_hours': 51.2,
 #  'risk_band': 'medium',
 #  'flagged_for_expediting': False,
-#  'threshold': 0.3651}
+#  'threshold': 0.3545}
 ```
 
 Invalid input raises `ValueError` with a message that is safe to show a user: missing fields,

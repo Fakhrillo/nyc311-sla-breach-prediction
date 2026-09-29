@@ -101,7 +101,8 @@ LEAKY_COLUMNS = {
 
 # Some cases are logged as closed seconds after being opened (auto-closed
 # duplicates), and a few are closed before they were created. Both are recording
-# artefacts rather than genuinely fast work, so they get treated as unknown.
+# artefacts rather than genuinely fast work, so their outcome is unusable.
+# apply_sla() drops them before labelling.
 MIN_RESOLUTION_HOURS = 0.02
 
 
@@ -195,18 +196,23 @@ def load_raw(path: Path | str = DATA) -> pd.DataFrame:
 
 
 def clean(raw: pd.DataFrame) -> pd.DataFrame:
-    """Parse the timestamps, work out how long each case took, drop impossible rows."""
+    """Parse the timestamps, work out how long each case took, blank impossible durations."""
     df = raw.copy()
     for col in ("created_date", "closed_date"):
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+        # ISO 8601 explicitly. Left to infer, pandas takes the format from the first
+        # value and silently turns any differently written timestamp into NaT, and
+        # a closed case with a NaT closed_date looks exactly like an open one.
+        df[col] = pd.to_datetime(df[col], errors="coerce", format="ISO8601")
 
     before = len(df)
     df = df[df["created_date"].notna()].drop_duplicates(subset="unique_key")
 
     df["resolution_hours"] = (df["closed_date"] - df["created_date"]).dt.total_seconds() / 3600
 
-    # Both of these become NaN rather than 0, which matters: NaN reads as "we do
-    # not know how long this took", and apply_sla() handles that case properly.
+    # Both of these become NaN rather than 0: NaN reads as "we do not know how
+    # long this took". Note that a NaN duration alone no longer says whether a
+    # case is open. These rows have a closed_date, and apply_sla() uses that to
+    # tell them apart from cases genuinely still open.
     df.loc[df["resolution_hours"] < 0, "resolution_hours"] = np.nan
     df.loc[df["resolution_hours"] < MIN_RESOLUTION_HOURS, "resolution_hours"] = np.nan
 
@@ -344,34 +350,57 @@ def fit_sla(train: pd.DataFrame, quantile: float = 0.75, min_cases: int = 200) -
     return {"per_type": sla, "default": overall, "quantile": quantile}
 
 
+def extract_time(df: pd.DataFrame) -> pd.Timestamp:
+    """When the extract was taken, as far as the file itself can tell.
+
+    The CSV carries no pull date, but it cannot hold a closure that had not
+    happened yet, so its latest closed_date is a lower bound on the pull. For the
+    shipped data that is 8 July 2026, more than two years after the last intake.
+
+    This used to be the last *created* date, 30 March 2024, which pretended the
+    data was pulled the moment intake stopped. That understated how long every
+    open case had really been open, and dropped some as "unknown" that were in
+    fact two years past their window.
+    """
+    return df["closed_date"].max()
+
+
 def apply_sla(df: pd.DataFrame, sla: dict, snapshot: pd.Timestamp | None = None) -> pd.DataFrame:
     """Label each case as a breach, dropping only the ones genuinely unknown.
 
-    The censoring case is easy to get wrong. A case still open when the data was
-    pulled has no resolution time, so the tempting move is to drop all of them.
-    That would be a mistake, and a self-serving one: cases still open after weeks
-    are exactly the slow cases the client cares about, and throwing them away
-    biases the training data towards work that goes smoothly.
+    Three kinds of case, told apart by closed_date, never by a missing duration:
 
-    So an open case that has already been open longer than its window is labelled
-    a breach. It has breached, whatever happens next. Only a case that is still
-    open *and* still inside its window is genuinely unknown, and those get
-    dropped.
+    - Closed, with a usable duration: breach if it took longer than its window.
+    - Closed, but the duration is unusable (closed before it opened, or an
+      auto-close within seconds; clean() blanks those). There is no real outcome
+      to learn from, so they are dropped here, before labelling. They used to
+      fall through as "open" and, being long past their window by the snapshot,
+      every one of them was labelled a breach.
+    - Still open at `snapshot`. Dropping all of these is the tempting move and a
+      self-serving one: cases still open after weeks are exactly the slow cases
+      the client cares about. An open case already past its window has breached,
+      whatever happens next. Only one still inside its window is unknown.
+
+    `snapshot` is when the data was pulled (see extract_time). With the shipped
+    extract every open case is two years old, far past the longest window, so in
+    practice none is left unknown.
     """
     df = df.copy()
-    snapshot = snapshot or df["created_date"].max()
+    snapshot = extract_time(df) if snapshot is None else snapshot
     df["sla_hours"] = df["complaint_type"].map(sla["per_type"]).fillna(sla["default"])
 
+    closed = df["closed_date"].notna()
+    invalid = closed & df["resolution_hours"].isna()
     elapsed = (snapshot - df["created_date"]).dt.total_seconds() / 3600
-    closed = df["resolution_hours"].notna()
 
     y = pd.Series(np.nan, index=df.index)
-    y[closed] = (df.loc[closed, "resolution_hours"] > df.loc[closed, "sla_hours"]).astype(float)
-    already = ~closed & (elapsed > df["sla_hours"])
-    y[already] = 1.0
+    ok = closed & ~invalid
+    y[ok] = (df.loc[ok, "resolution_hours"] > df.loc[ok, "sla_hours"]).astype(float)
+    y[~closed & (elapsed > df["sla_hours"])] = 1.0
 
     df["y"] = y
-    df.attrs["censored_dropped"] = int(y.isna().sum())
+    df.attrs["invalid_dropped"] = int(invalid.sum())
+    df.attrs["censored_dropped"] = int((~closed & y.isna()).sum())
     return df[y.notna()].assign(y=lambda d: d["y"].astype(int))
 
 

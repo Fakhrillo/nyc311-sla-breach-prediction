@@ -113,7 +113,7 @@ def split_ablation(df: pd.DataFrame, sla_def: dict, cfg: dict) -> str:
     """
     from sklearn.model_selection import train_test_split
 
-    labelled = S.apply_sla(df, sla_def, snapshot=df["created_date"].max())
+    labelled = S.apply_sla(df, sla_def, snapshot=S.extract_time(df))
     rtr, rva = train_test_split(labelled, test_size=0.15, random_state=0, shuffle=True)
     pipe = S.make_model("hgb", **cfg).fit(rtr[S.FEATURES], rtr["y"])
     rnd = S.evaluate(rva["y"], score(pipe, rva[S.FEATURES]))
@@ -217,8 +217,9 @@ def main() -> None:
 
     print("Loading NYC 311 and building features...")
     df = S.build_dataset(args.data)
-    snapshot = df["created_date"].max()
-    print(f"  {len(df):,} cases | {df['created_date'].min():%Y-%m-%d} -> {snapshot:%Y-%m-%d}")
+    snapshot = S.extract_time(df)
+    print(f"  {len(df):,} cases | {df['created_date'].min():%Y-%m-%d} -> "
+          f"{df['created_date'].max():%Y-%m-%d} | extract taken by {snapshot:%Y-%m-%d}")
 
     # Split, then fit the windows on train, then label. Any other order leaks.
     train, val, test = S.time_split(df)
@@ -226,6 +227,10 @@ def main() -> None:
     train = S.apply_sla(train, sla_def, snapshot)
     val = S.apply_sla(val, sla_def, snapshot)
     test = S.apply_sla(test, sla_def, snapshot)
+    print("  dropped before labelling: "
+          + " | ".join(f"{n} {p.attrs['invalid_dropped']:,} invalid-duration, "
+                       f"{p.attrs['censored_dropped']:,} still inside window"
+                       for n, p in (("train", train), ("val", val), ("test", test))))
     print(f"  train {len(train):,} ({train.y.mean():.3f}) | val {len(val):,} ({val.y.mean():.3f})"
           f" | test {len(test):,} ({test.y.mean():.3f})  <- breach rates")
     print(f"  service windows: {len(sla_def['per_type'])} types, "

@@ -23,7 +23,7 @@ code has to be explainable, not just correct.
 - **Never write a number into the README, a docstring or a notebook that was not produced by
   running the code.** If a metric changes, re-run `train.py` and copy the new value. Inventing
   or adjusting results fails the whole capstone outright (evaluation criteria §6).
-- After any change to `src/sla.py` or `train.py`, run `python test_sla.py` (12 tests,
+- After any change to `src/sla.py` or `train.py`, run `python test_sla.py` (15 tests,
   ~3 s). After a change touching features, the target or the split, re-run `train.py` and
   confirm the reported metrics still match the README.
 - The test set is scored once, in `train.py`, after the model and threshold are fixed on

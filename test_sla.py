@@ -94,6 +94,41 @@ def test_open_case_past_its_window_is_a_breach():
     assert list(out["y"]) == [0, 1, 1], list(out["y"])
 
 
+def test_invalid_duration_is_dropped_not_labelled_a_breach():
+    # An auto-close or a closure before intake has a closed_date but no usable
+    # duration. These used to fall through as "still open" and, being long past
+    # their window by the snapshot, every one was labelled a breach.
+    raw = pd.DataFrame({
+        "unique_key": [1, 2, 3, 4],
+        "created_date": ["2024-01-02 10:00", "2024-01-02 11:00", "2024-01-02 12:00", "2024-01-02 13:00"],
+        "closed_date": ["2024-01-02 10:00:10", None, "2024-01-02 14:00", "2024-01-01 13:00"],
+        "agency": ["A"] * 4, "complaint_type": ["t"] * 4, "descriptor": ["d"] * 4,
+        "borough": ["BX"] * 4, "incident_zip": [10001] * 4,
+        "open_data_channel_type": ["ONLINE"] * 4, "location_type": ["x"] * 4,
+        "address_type": ["ADDRESS"] * 4, "status": ["Closed", "Open", "Closed", "Closed"],
+    })
+    sla = {"per_type": {"T": 24.0}, "default": 24.0, "quantile": 0.75}
+    out = S.apply_sla(S.clean(raw), sla, snapshot=pd.Timestamp("2024-06-01"))
+    assert out.attrs["invalid_dropped"] == 2
+    # The genuinely open case is still kept, and it is a breach; the normal one is not.
+    assert list(out["unique_key"]) == [2, 3] and list(out["y"]) == [1, 0], out[["unique_key", "y"]]
+
+
+def test_snapshot_is_when_the_extract_was_taken():
+    df = _frame([
+        {"agency": "A", "complaint_type": "T", "created_date": "2024-03-30", "closed_date": "2024-07-01"},
+        {"agency": "A", "complaint_type": "T", "created_date": "2024-03-30 22:00", "closed_date": None},
+    ])
+    # The file cannot hold a closure that had not happened yet.
+    assert S.extract_time(df) == pd.Timestamp("2024-07-01")
+    sla = {"per_type": {"T": 24.0}, "default": 24.0, "quantile": 0.75}
+    out = S.apply_sla(df, sla)
+    # Taking the last intake as the snapshot would have called the open case two
+    # hours old and dropped it. By the time the data was pulled it was three
+    # months past a one-day window.
+    assert out.attrs["censored_dropped"] == 0 and list(out["y"]) == [1, 1], list(out["y"])
+
+
 def test_split_is_chronological_and_whole_days():
     df = _frame([
         {"agency": "A", "complaint_type": "T", "created_date": f"2024-01-{d:02d} {h:02d}:00",
